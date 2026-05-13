@@ -1,0 +1,40 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agentscribe"
+version = "0.1.0"
+description = "Capture agent conversations and convert them into fine-tuning datasets"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "Aryan Jain", email = "aryan.jain@mail.utoronto.ca"}
+]
+keywords = ["llm", "agents", "fine-tuning", "dataset", "agentic-ai"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+dependencies = [
+    "click>=8.0",
+    "loguru>=0.7.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+s3 = ["boto3", "s3fs"]
+gcs = ["gcsfs"]
+azure = ["adlfs"]
+all = ["boto3", "s3fs", "gcsfs", "adlfs"]
+
+[project.scripts]
+agentscribe = "agentscribe.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["agentscribe"]
