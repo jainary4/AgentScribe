@@ -1,9 +1,8 @@
 # formatter.py
 
-import json
-from pathlib import Path
 from typing import Literal
 from agentscribe.core.canonical import CanonicalInteraction
+from agentscribe.storage import write_jsonl
 
 class Formatter:
     """Converts canonical interactions into fine-tuning dataset formats."""
@@ -82,13 +81,6 @@ class Formatter:
             }
 
     def format_and_save(self, interactions: list[CanonicalInteraction], output_path: str):
-        """Format all interactions and write to a JSONL file."""
-        output = Path(output_path)
-        output.parent.mkdir(parents=True, exist_ok=True)
-
-        with open(output, "w", encoding="utf-8") as f:
-            for interaction in interactions:
-                formatted = self.format_single(interaction)
-                f.write(json.dumps(formatted, ensure_ascii=False) + "\n")
-
-        return len(interactions)
+        """Format all interactions and write to a local or cloud JSONL target."""
+        result = write_jsonl(output_path, (self.format_single(interaction) for interaction in interactions))
+        return result.records_written

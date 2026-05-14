@@ -29,9 +29,11 @@ dependencies = [
 
 [project.optional-dependencies]
 s3 = ["boto3", "s3fs"]
+r2 = ["boto3", "s3fs"]
 gcs = ["gcsfs"]
 azure = ["adlfs"]
-all = ["boto3", "s3fs", "gcsfs", "adlfs"]
+postgres = ["psycopg[binary]>=3.1"]
+all = ["boto3", "s3fs", "gcsfs", "adlfs", "psycopg[binary]>=3.1"]
 
 [project.scripts]
 agentscribe = "agentscribe.cli:main"
