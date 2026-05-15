@@ -173,6 +173,11 @@ def convert(
 
 
 def _ensure_supported_source(source: str) -> None:
+
+	"""Check that the source identifier is a known local format or a known adapter (even if not yet implemented). 
+	Raise a helpful error otherwise.
+	Usage: Called at the start of convert after normalizing the source string."""
+
 	if source in LOCAL_SOURCES:
 		return
 	if source in ADAPTER_SOURCES:
@@ -185,6 +190,11 @@ def _ensure_supported_source(source: str) -> None:
 
 
 def _load_records(source: str, input_path: str) -> Iterator[Mapping[str, Any]]:
+
+	"""Read and parse input data (file or stdin) into an iterator of record dictionaries, 
+	using the source hint to select a parser.
+	Usage: Called by convert to turn the raw input into record dictionaries."""
+
 	if input_path == "-":
 		yield from _parse_json_documents(sys.stdin.read())
 		return
@@ -201,6 +211,11 @@ def _load_records(source: str, input_path: str) -> Iterator[Mapping[str, Any]]:
 
 
 def _parse_json_documents(text: str) -> Iterator[Mapping[str, Any]]:
+
+	"""Parse a raw text string into an iterator of JSON objects, 
+	trying first as a full JSON document, then as JSONL line by line
+	Usage: only when input_path == '-' """
+
 	stripped = text.strip()
 	if not stripped:
 		return
@@ -225,6 +240,12 @@ def _parse_json_documents(text: str) -> Iterator[Mapping[str, Any]]:
 
 
 def _read_json_document(input_path: str) -> Any:
+
+	"""Open and read a JSON file from any supported storage backend, 
+	transparently handling gzip compression
+
+	Usage: Called by _load_records when input is not JSONL and not stdin"""
+
 	try:
 		backend = get_backend(input_path)
 	except StorageError as exc:
@@ -244,6 +265,9 @@ def _read_json_document(input_path: str) -> Any:
 
 
 def _ensure_mapping_records(records: Iterable[Any]) -> Iterator[Mapping[str, Any]]:
+
+	"""Validate that every item in an iterable is a dictionary, raising an error for the first non‑mapping item found"""
+
 	for index, record in enumerate(records, start=1):
 		if not isinstance(record, Mapping):
 			raise click.ClickException(f"Record {index} is not a JSON object")
@@ -257,6 +281,11 @@ def _format_records(
 	format_name: str,
 	skip_invalid: bool,
 ) -> Iterator[Mapping[str, Any]]:
+	
+	"""Convert each raw record to a canonical message list, 
+	then format to the desired output, optionally skipping invalid records
+
+	Usage: Core loop inside the convert command"""
 	for index, record in enumerate(records, start=1):
 		try:
 			messages = _record_to_messages(record, source=source)
@@ -268,6 +297,10 @@ def _format_records(
 
 
 def _record_to_messages(record: Mapping[str, Any], *, source: str) -> list[dict[str, Any]]:
+
+	"""Transform a raw record into a canonical list of message dicts, auto‑detecting the input structure
+	Usage:Called by _format_records for every input record."""
+
 	if "messages" in record:
 		return [_normalize_message(message) for message in _expect_list(record["messages"], "messages")]
 
@@ -284,15 +317,20 @@ def _record_to_messages(record: Mapping[str, Any], *, source: str) -> list[dict[
 
 
 def _normalize_message(message: Any) -> dict[str, Any]:
+
+	"""Convert a raw message dict into a canonical dict with role and content, preserving any extra fields
+	Usage: Used by _record_to_messages whenever we encounter a message in a list."""
+
 	if not isinstance(message, Mapping):
-		raise click.ClickException("message entries must be JSON objects")
+		raise click.ClickException("message entries must be JSON objects") # checks if the message is a valid json object( dictionary)
+
 
 	role = message.get("role") or message.get("from")
 	if not role:
 		raise click.ClickException("message is missing role/from")
 
 	role = SHAREGPT_TO_CANONICAL.get(str(role), str(role))
-	content = message.get("content", message.get("value", ""))
+	content = message.get("content", message.get("value", "")) # maps the role to the canconical format
 	normalized = {"role": role, "content": _coerce_text(content)}
 
 	for key, value in message.items():
@@ -302,9 +340,13 @@ def _normalize_message(message: Any) -> dict[str, Any]:
 
 
 def _alpaca_to_messages(record: Mapping[str, Any]) -> list[dict[str, Any]]:
-	messages: list[dict[str, Any]] = []
 
-	for turn in record.get("history") or []:
+	"""Convert an Alpaca‑style record (instruction, output, optional history) into a flat canonical message list
+	Usage: Used by _record_to_messages when Alpaca format is detected"""
+
+	messages: list[dict[str, Any]] = [] #Start with an empty list
+
+	for turn in record.get("history") or []: #If the record has a history field, each turn must be a pair of strings (user, assistant)
 		if not isinstance(turn, (list, tuple)) or len(turn) != 2:
 			raise click.ClickException("Alpaca history entries must be [user, assistant] pairs")
 		messages.append({"role": "user", "content": _coerce_text(turn[0])})
@@ -314,7 +356,7 @@ def _alpaca_to_messages(record: Mapping[str, Any]) -> list[dict[str, Any]]:
 	input_text = _coerce_text(record.get("input", ""))
 	user_content = f"{instruction}\n\n{input_text}".strip() if input_text else instruction
 	if user_content:
-		messages.append({"role": "user", "content": user_content})
+		messages.append({"role": "user", "content": user_content}) #Combine the instruction and optional input into one user message
 
 	output = _coerce_text(record.get("output", ""))
 	if output:
@@ -323,11 +365,17 @@ def _alpaca_to_messages(record: Mapping[str, Any]) -> list[dict[str, Any]]:
 
 
 def _prompt_record_to_messages(record: Mapping[str, Any]) -> list[dict[str, Any]]:
+
+	"""Convert a prompt‑completion or preference record into a canonical message list.
+	Usage: Called by _record_to_messages for prompt‑based records."""
 	prompt = record.get("prompt", "")
 	if isinstance(prompt, list):
 		messages = [_normalize_message(message) for message in prompt]
 	else:
 		messages = [{"role": "user", "content": _coerce_text(prompt)}]
+
+	#If the prompt field is already a list of messages (like in DPO or OpenAI format), we normalize each one. 
+	# Otherwise, treat the prompt as a single user string
 
 	if "completion" in record:
 		messages.append({"role": "assistant", "content": _coerce_text(record.get("completion", ""))})
@@ -342,6 +390,11 @@ def _prompt_record_to_messages(record: Mapping[str, Any]) -> list[dict[str, Any]
 
 
 def _format_messages(messages: list[dict[str, Any]], format_name: str) -> Mapping[str, Any]:
+
+	"""Route a canonical message list to the appropriate output formatter based on the chosen format name
+	Usage: Called by _format_records after normalizing a record"""
+
+	#simple dispatcher that calls the appropriate conversion function
 	if format_name == "openai_chat":
 		return {"messages": [_to_openai_message(message) for message in messages]}
 	if format_name == "sharegpt":
@@ -356,6 +409,10 @@ def _format_messages(messages: list[dict[str, Any]], format_name: str) -> Mappin
 
 
 def _to_openai_message(message: Mapping[str, Any]) -> dict[str, Any]:
+
+	"""Convert a single canonical message into an OpenAI‑compatible message dict
+	Usage: Called by _format_messages for openai_chat."""
+
 	role = OPENAI_ROLE_MAP.get(str(message["role"]), str(message["role"]))
 	result = {"role": role, "content": message.get("content", "")}
 	for key in OPENAI_MESSAGE_EXTRAS:
@@ -365,6 +422,10 @@ def _to_openai_message(message: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _to_sharegpt(messages: list[dict[str, Any]]) -> Mapping[str, Any]:
+
+	"""Convert a list of canonical messages into a ShareGPT‑style record
+	Usage:Called by _format_messages for sharegpt."""
+
 	conversations = []
 	system = ""
 	for message in messages:
@@ -381,20 +442,27 @@ def _to_sharegpt(messages: list[dict[str, Any]]) -> Mapping[str, Any]:
 
 
 def _to_alpaca(messages: list[dict[str, Any]]) -> Mapping[str, Any]:
+
+	"""Convert a list of canonical messages to an Alpaca record (instruction, output, optional history)
+	Usage: Called by _format_messages for alpaca"""
+
 	user_messages = [message for message in messages if message["role"] == "user"]
 	assistant_messages = [message for message in messages if message["role"] == "assistant"]
 	system_message = next((message for message in messages if message["role"] == "system"), None)
+	#Separate messages into user and assistant lists, find the first system message if any
 
 	instruction = _coerce_text(user_messages[-1].get("content", "")) if user_messages else ""
 	if system_message:
 		instruction = f"{_coerce_text(system_message.get('content', ''))}\n\n{instruction}".strip()
+	
+	#The last user message becomes the main instruction. If there's a system message, prepend it with a double newline
 
 	result: dict[str, Any] = {
 		"instruction": instruction,
 		"input": "",
 		"output": _coerce_text(assistant_messages[-1].get("content", "")) if assistant_messages else "",
 	}
-
+	#Build the core Alpaca dict. input is left empty
 	history_pairs = list(zip(user_messages[:-1], assistant_messages[:-1]))
 	if history_pairs:
 		result["history"] = [
@@ -405,6 +473,11 @@ def _to_alpaca(messages: list[dict[str, Any]]) -> Mapping[str, Any]:
 
 
 def _to_prompt_completion(messages: list[dict[str, Any]]) -> Mapping[str, Any]:
+
+	""" Convert a canonical message list into a simple prompt‑completion pair
+	Usage: Called by _format_messages for prompt_completion"""
+
+	#Find the first user message and the last assistant message. Return them as a prompt/completion dict
 	user_message = next((message for message in messages if message["role"] == "user"), None)
 	assistant_message = next((message for message in reversed(messages) if message["role"] == "assistant"), None)
 	return {
@@ -414,6 +487,10 @@ def _to_prompt_completion(messages: list[dict[str, Any]]) -> Mapping[str, Any]:
 
 
 def _to_preference(messages: list[dict[str, Any]]) -> Mapping[str, Any]:
+
+	"""Convert a canonical message list into a DPO preference record with an empty rejected field
+	Usage: Called by _format_messages for preference"""
+
 	user_content = " ".join(_coerce_text(message.get("content", "")) for message in messages if message["role"] == "user")
 	assistant_content = " ".join(
 		_coerce_text(message.get("content", "")) for message in messages if message["role"] == "assistant"
@@ -426,6 +503,10 @@ def _to_preference(messages: list[dict[str, Any]]) -> Mapping[str, Any]:
 
 
 def _write_stdout(records: Iterable[Mapping[str, Any]]) -> int:
+	""" Write formatted records as compact JSONL to stdout and return the count
+	Usage: Uses click.echo to print each record as a single line. s
+	eparators=(",", ":") removes spaces, making the output more compact. Returns the number of records written."""
+
 	count = 0
 	for record in records:
 		click.echo(json.dumps(record, ensure_ascii=False, separators=(",", ":")))
@@ -434,6 +515,10 @@ def _write_stdout(records: Iterable[Mapping[str, Any]]) -> int:
 
 
 def _parse_metadata(entries: tuple[str, ...]) -> Mapping[str, str]:
+
+	"""Parse repeated KEY=VALUE strings into a metadata dictionary
+	Usage : Called at the beginning of convert to process the --metadata options"""
+
 	metadata: dict[str, str] = {}
 	for entry in entries:
 		if "=" not in entry:
@@ -446,25 +531,42 @@ def _parse_metadata(entries: tuple[str, ...]) -> Mapping[str, str]:
 
 
 def _expect_list(value: Any, field_name: str) -> list[Any]:
+
+	""" Assert that a value is a list; raise a readable error if not
+	Usage: Used in _record_to_messages to validate messages and conversations fields"""
+
 	if not isinstance(value, list):
 		raise click.ClickException(f"{field_name} must be a list")
 	return value
 
 
 def _looks_like_alpaca(record: Mapping[str, Any]) -> bool:
+
+	""" Return True if the record contains both instruction and output keys"""
+
 	return "instruction" in record and "output" in record
 
 
 def _looks_like_jsonl(input_path: str) -> bool:
+
+	""" Check if a file path likely points to a JSONL file by its extension"""
+
 	suffixes = Path(input_path).suffixes
 	return ".jsonl" in suffixes or ".ndjson" in suffixes
 
 
 def _looks_gzipped(input_path: str) -> bool:
+
+	"""Return True if the file path ends with .gz"""
+
 	return ".gz" in Path(input_path).suffixes
 
 
 def _coerce_text(value: Any) -> str:
+
+	"""Safely convert any value to a string: None becomes empty, 
+	strings pass through, anything else is serialised to JSON"""
+
 	if value is None:
 		return ""
 	if isinstance(value, str):
