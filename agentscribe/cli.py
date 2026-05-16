@@ -12,12 +12,27 @@ from typing import Any
 
 import click
 
+from agentscribe.adapters.utils.registry import adapter_record_to_interactions as dispatch_adapter_record
+from agentscribe.core.canonical import CanonicalInteraction
 from agentscribe.storage import StorageError, StorageURI, get_backend, read_jsonl, write_jsonl
 
 
 FORMATS = ("openai_chat", "alpaca", "sharegpt", "prompt_completion", "preference")
 LOCAL_SOURCES = ("auto", "json", "jsonl", "canonical", "openai_chat", "sharegpt", "alpaca", "prompt_completion", "preference")
-ADAPTER_SOURCES = ("crewai", "langgraph", "agno", "autogen", "atomic", "agentops", "mlflow")
+ADAPTER_SOURCES = (
+	"crewai",
+	"langgraph",
+	"agno",
+	"autogen",
+	"ag2",
+	"atomic",
+	"atomic_agents",
+	"agentops",
+	"mlflow",
+	"opentelemetry",
+	"openinference",
+	"mcp",
+)
 STORAGE_SCHEMES = ("file", "s3", "r2", "gs", "gcs", "az", "abfs", "abfss", "postgres", "postgresql", "pg")
 
 AGENTSCRIBE_BANNER = r"""
@@ -181,10 +196,7 @@ def _ensure_supported_source(source: str) -> None:
 	if source in LOCAL_SOURCES:
 		return
 	if source in ADAPTER_SOURCES:
-		raise click.ClickException(
-			f"The `{source}` adapter is not implemented in the CLI yet. "
-			"Use `json`, `jsonl`, or `canonical` input for now."
-		)
+		return
 	accepted = ", ".join((*LOCAL_SOURCES, *ADAPTER_SOURCES))
 	raise click.ClickException(f"Unknown source `{source}`. Expected one of: {accepted}")
 
@@ -288,12 +300,35 @@ def _format_records(
 	Usage: Core loop inside the convert command"""
 	for index, record in enumerate(records, start=1):
 		try:
-			messages = _record_to_messages(record, source=source)
-			yield _format_messages(messages, format_name)
+			if source in ADAPTER_SOURCES:
+				for messages in _adapter_record_to_message_batches(record, source=source):
+					yield _format_messages(messages, format_name)
+			else:
+				messages = _record_to_messages(record, source=source)
+				yield _format_messages(messages, format_name)
 		except click.ClickException as exc:
 			if not skip_invalid:
 				raise click.ClickException(f"Record {index}: {exc.message}") from exc
 			click.echo(f"Skipping record {index}: {exc.message}", err=True)
+
+
+def _adapter_record_to_message_batches(record: Mapping[str, Any], *, source: str) -> list[list[dict[str, Any]]]:
+
+	"""Convert an adapter export record into one or more canonical message lists.
+	Usage: Called by _format_records for framework/platform sources."""
+
+	if "messages" in record and "source_framework" in record:
+		return [CanonicalInteraction.from_dict(dict(record)).to_dict()["messages"]]
+
+	interactions = _adapter_record_to_interactions(record, source=source)
+	return [interaction.to_dict()["messages"] for interaction in interactions]
+
+
+def _adapter_record_to_interactions(record: Mapping[str, Any], *, source: str) -> list[CanonicalInteraction]:
+
+	"""Dispatch JSON exports to the relevant optional-dependency adapter."""
+
+	return dispatch_adapter_record(record, source=source)
 
 
 def _record_to_messages(record: Mapping[str, Any], *, source: str) -> list[dict[str, Any]]:
