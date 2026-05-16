@@ -9,7 +9,8 @@ description = "Capture agent conversations and convert them into fine-tuning dat
 requires-python = ">=3.10"
 license = {text = "MIT"}
 authors = [
-    {name = "Aryan Jain", email = "aryan.jain@mail.utoronto.ca"}
+    {name = "Aryan Jain", email = "aryan.jain@mail.utoronto.ca"},
+    {name = "Tori Sirak", email = "torisirak@cmail.carleton.ca"}
 ]
 keywords = ["llm", "agents", "fine-tuning", "dataset", "agentic-ai"]
 classifiers = [
