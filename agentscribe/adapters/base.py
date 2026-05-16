@@ -1,8 +1,7 @@
-# agentscribe/adapters/base.py
 """Base adapter class for all framework adapters.
 
 Provides buffering, formatting, storage writing, and session tracking.
-Framework‑specific adapters inherit from this class and implement
+Framework-specific adapters inherit from this class and implement
 their own capture hooks / listeners.
 """
 
@@ -44,9 +43,7 @@ class BaseAdapter:
         self._pending: dict[str, CanonicalInteraction] = {}
         self._formatter = Formatter(format=self._format)
 
-
     def _finalise_and_flush(self, session_id: str) -> None:
-
         """Move a finished interaction from pending to the buffer.
 
         If the buffer reaches ``_flush_interval``, write everything to storage.
@@ -68,13 +65,11 @@ class BaseAdapter:
             return
         with self._lock:
             self._buffer.append(interaction)
-            if len(self._buffer) >= self._flush_interval:
+            if self._flush_interval <= 0 or len(self._buffer) >= self._flush_interval:
                 self._flush_buffer()
 
-
     def _flush_buffer(self) -> int:
-
-        """ Format and write all buffered interactions to storage.
+        """Format and write all buffered interactions to storage.
 
         Returns
         -------
@@ -84,7 +79,8 @@ class BaseAdapter:
         Notes
         -----
         If the write fails, the interactions are **put back** into the buffer
-        so they are not lost"""
+        so they are not lost.
+        """
 
         if not self._buffer:
             return 0
@@ -93,18 +89,15 @@ class BaseAdapter:
         self._buffer.clear()
 
         try:
-            formatted = [self._formatter.format_single(i) for i in interactions]
+            formatted = [self._formatter.format_single(interaction) for interaction in interactions]
             write_jsonl(self._output, formatted, mode="a")
             return len(formatted)
-
         except Exception:
             self._buffer = interactions + self._buffer
             return 0
 
-
     def flush(self) -> int:
-
-         """Write all buffered interactions to storage immediately.
+        """Write all buffered interactions to storage immediately.
 
         Returns
         -------
@@ -113,29 +106,31 @@ class BaseAdapter:
 
         Examples
         --------
-         adapter = SomeAdapter(output="./data.jsonl")
-         # … agent runs …
-         adapter.flush()  # force write everything buffered so far
+        adapter = SomeAdapter(output="./data.jsonl")
+        # ... agent runs ...
+        adapter.flush()  # force write everything buffered so far
         5
         """
+
         with self._lock:
             return self._flush_buffer()
 
-    def __enter__(self):
-
-          """Enter a ``with`` block — no special setup needed."""
+    def __enter__(self) -> "BaseAdapter":
+        """Enter a ``with`` block - no special setup needed."""
 
         return self
 
-    def __exit__(self, *args):
-
-        """Exit the ``with`` block — automatically flushes all data.
+    def __exit__(self, *args: Any) -> None:
+        """Exit the ``with`` block - automatically flushes all data.
 
         Example
         -------
-         with SomeAdapter(output="./data.jsonl") as adapter:
+        with SomeAdapter(output="./data.jsonl") as adapter:
             crew.kickoff()
             # flush() is called automatically here
-        """"
-        
+        """
+
         self.flush()
+
+
+__all__ = ["BaseAdapter"]
