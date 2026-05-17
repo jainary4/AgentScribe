@@ -34,6 +34,7 @@ gcs = ["gcsfs"]
 azure = ["adlfs"]
 postgres = ["psycopg[binary]>=3.1"]
 all = ["boto3", "s3fs", "gcsfs", "adlfs", "psycopg[binary]>=3.1"]
+test = ["pytest>=8"]
 
 [project.scripts]
 agentscribe = "agentscribe.cli:main"
