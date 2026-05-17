@@ -118,10 +118,10 @@ The **in‑process mode** is the recommended approach because it captures data l
 - ✅ Works even with `verbose=False`.
 - ✅ Data is saved automatically to local storage or cloud (S3, GCS, Azure).
 
-**What the user experience looks like (conceptual):**
+**What the user experience looks like:**
 
 1. Import AgentScribe’s CrewAI adapter.
-2. Create a `SynthCollectHook` with your desired output format and storage location.
+2. Create a `CrewAIAdapter` with your desired output format and storage location.
 3. Run your crew as usual.
 
 > AgentScribe attaches `after_llm_call` and `after_tool_call` hooks that serialize every interaction into the canonical format and write them to your chosen storage.
@@ -149,25 +149,33 @@ All these are saved as a single, ready‑to‑use training example.
 
 ---
 
-## 6. Configuration example (conceptual)
+## 6. Configuration examples
 
 *In‑process (hooks)*
 
 ```python
-from agentscribe.adapters.crewai import SynthCollectHook
+from agentscribe.adapters.crewai import CrewAIAdapter
 
 # One line to activate capture
-capture = SynthCollectHook(
+capture = CrewAIAdapter(
     format="sharegpt",            # or "openai_chat", "alpaca", etc.
     output="s3://my-bucket/training/",  # local, S3, GCS, Azure
 )
 
 crew = Crew(agents=[...], tasks=[...])
 crew.kickoff()
+capture.flush()
 ```
 # Training data is now in s3://my-bucket/training/
 
-```bash
+*Post-hoc converter*
 
-agentscribe convert crewai ./run_logs.json --format openai_chat --output ./dataset.jsonls
+```python
+from agentscribe.adapters.crewai import from_llm_call_context
+
+interaction = from_llm_call_context(saved_hook_context)
+```
+
+```bash
+agentscribe convert crewai ./run_logs.json --format openai_chat --output ./dataset.jsonl
 ```

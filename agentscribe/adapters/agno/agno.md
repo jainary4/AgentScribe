@@ -219,24 +219,22 @@ AgentScribe offers two integration modes:
 
 | Mode | How it works | What you do |
 |---|---|---|
-| **In‑process (Python library)** | AgentScribe registers MLflow autolog or post‑hooks that fire during agent execution, building `CanonicalInteraction` objects in real time. | Add 2–3 lines of code before creating your agent. |
-| **Post‑hoc (CLI)** | After the run, point AgentScribe at MLflow traces, session data, or `RunOutput` exports and convert them to a training dataset. | Run `agentscribe convert agno <source> --format <fmt> --output <path>` |
+| **In‑process (Python library)** | `AgnoAdapter` registers post‑hooks and optional tool hooks, building `CanonicalInteraction` objects in real time. | Pass `capture.post_hook` and optionally `capture.tool_hook` to your agent. |
+| **Post‑hoc (CLI)** | After the run, point AgentScribe at MLflow/AgentOS traces, session data, event streams, or `RunOutput` exports and convert them to a training dataset. | Run `agentscribe convert agno <json-file> --format <fmt> --output <path>` |
 
-The in‑process mode via MLflow autolog is the recommended approach – it captures everything automatically, requires only one function call, and stores data in your preferred format without extra processing.
+The in‑process post‑hook mode is the recommended direct integration because it has no extra import-time dependency and reads Agno's native `RunOutput.messages` payload.
 
 ---
 
-## 4. Recommended integration: MLflow autolog (in‑process)
+## 4. Recommended integration: Post‑hooks (in‑process)
 
 **Why this is the best option:**
 
-- ✅ Captures every agent run, model call, and tool execution automatically.
-- ✅ Preserves multi‑agent interactions – agent handoffs, team delegation, member responses.
-- ✅ Tracks token usage and cost for each LLM call.
-- ✅ One‑line activation – no per‑agent configuration.
-- ✅ Traces are OpenTelemetry‑native and can be consumed by AgentScribe's trace parser.
-- ✅ Works with both self‑hosted and managed MLflow servers.
-- ✅ Data is saved automatically to local storage or cloud (S3, GCS, Azure).
+- ✅ Captures each agent run through Agno's native `RunOutput`.
+- ✅ Preserves user, assistant, system, and tool messages.
+- ✅ Can be combined with tool hooks for tool arguments and results.
+- ✅ Requires no extra dependency beyond Agno.
+- ✅ Data is saved directly to local storage or cloud (S3, GCS, Azure).
 
 **What the user experience looks like:**
 
@@ -252,6 +250,8 @@ capture = AgnoAdapter(
 agent = Agent(
     model=OpenAIChat(id="gpt-4o"),
     tools=[YFinanceTools(stock_price=True)],
+    post_hooks=[capture.post_hook],
+    tool_hooks=[capture.tool_hook],
 )
 agent.print_response("What is the stock price of Apple?")
 # Training data is now in s3://my-bucket/training/
@@ -268,9 +268,9 @@ agent.print_response("What is the stock price of Apple?")
 
 ---
 
-## 5. Alternative integration: Post‑hooks (in‑process, no MLflow dependency)
+## 5. Post‑hoc converters
 
-If you prefer not to add MLflow as a dependency, AgentScribe can also capture data through Agno's native post‑hooks.
+If you already have Agno data saved, use the converter functions directly or the CLI. The public converters are `from_run_output`, `from_session`, `from_event_stream`, and `from_trace`.
 
 **Why this is a strong alternative:**
 
@@ -283,18 +283,9 @@ If you prefer not to add MLflow as a dependency, AgentScribe can also capture da
 **Example:**
 
 ```python
-from agentscribe.adapters.agno import AgnoHookAdapter
+from agentscribe.adapters.agno import from_run_output
 
-capture = AgnoHookAdapter(format="openai_chat", output="./data.jsonl")
-
-agent = Agent(
-    model=OpenAIChat(id="gpt-4o"),
-    tools=[YFinanceTools(stock_price=True)],
-    post_hooks=[capture.post_hook],   # captures full messages
-    tool_hooks=[capture.tool_hook],   # captures individual tool calls
-)
-agent.print_response("What is the stock price of Apple?")
-capture.flush()  # optional – also auto‑flushed on garbage collection
+interaction = from_run_output(saved_run_output)
 ```
 
 ---
@@ -303,7 +294,7 @@ capture.flush()  # optional – also auto‑flushed on garbage collection
 
 | Your current setup | AgentScribe's recommendation |
 |---|---|
-| No logging at all | Add `AgnoAdapter` (MLflow autolog) or `AgnoHookAdapter` (post‑hooks) – one line and you're capturing. |
+| No logging at all | Add `AgnoAdapter` post‑hooks – one line and you're capturing. |
 | Using AgentOS tracing | Keep your traces; AgentScribe's CLI can query `agno_spans` and convert them to training datasets. |
 | Using MLflow autolog already | Point AgentScribe at your MLflow tracking server to extract trace data and format it. |
 | Using post‑hooks already | Add AgentScribe's capture logic inside your existing hook function. |
@@ -315,7 +306,7 @@ capture.flush()  # optional – also auto‑flushed on garbage collection
 
 ## 7. Configuration examples (comprehensive)
 
-### 7.1 MLflow autolog with local output
+### 7.1 Post-hooks with local output
 
 ```python
 from agentscribe.adapters.agno import AgnoAdapter
@@ -324,11 +315,16 @@ from agno.models.openai import OpenAIChat
 
 capture = AgnoAdapter(format="openai_chat", output="./agno_training.jsonl")
 
-agent = Agent(model=OpenAIChat(id="gpt-4o"), tools=[...])
+agent = Agent(
+    model=OpenAIChat(id="gpt-4o"),
+    tools=[...],
+    post_hooks=[capture.post_hook],
+    tool_hooks=[capture.tool_hook],
+)
 agent.print_response("Hello world")
 ```
 
-### 7.2 MLflow autolog with S3 output
+### 7.2 Post-hooks with S3 output
 
 ```python
 capture = AgnoAdapter(format="sharegpt", output="s3://my-bucket/agno_data/")
@@ -357,20 +353,16 @@ agent = Agent(
 )
 ```
 
-### 7.4 Post‑hoc CLI: convert MLflow traces
+### 7.4 Post‑hoc CLI: convert MLflow or AgentOS traces
 
 ```bash
-agentscribe convert agno-mlflow ./mlruns/ --format openai_chat --output ./dataset.jsonl
+agentscribe convert agno ./agno_trace.json --format openai_chat --output ./dataset.jsonl
 ```
 
 ### 7.5 Post‑hoc CLI: convert session messages from database
 
 ```bash
-agentscribe convert agno-session \
-    --db-url "postgresql://user:pass@localhost:5432/agno_db" \
-    --session-id "sess_123" \
-    --format sharegpt \
-    --output ./session_dataset.jsonl
+agentscribe convert agno ./agno_session.json --format sharegpt --output ./session_dataset.jsonl
 ```
 
 ---
@@ -396,10 +388,10 @@ This normalised form is then converted to the desired fine‑tuning format (Open
 
 ## 9. Summary
 
-- **Best for complete data with minimal code:** MLflow autolog via `AgnoAdapter`.
-- **Best for zero additional dependencies:** Post‑hooks via `AgnoHookAdapter`.
+- **Best for complete data with minimal code:** Post‑hooks via `AgnoAdapter`.
+- **Best for post‑hoc data:** `from_run_output`, `from_session`, `from_event_stream`, and `from_trace`.
 - **Best for production AgentOS deployments:** AgentOS tracing + CLI batch extraction.
 - **Best for logs you already have:** Session messages or `RunOutput` exports + AgentScribe CLI.
 - **Always insufficient alone:** Debug mode (unstructured terminal output).
 
-AgentScribe's Agno adapter is designed to make either the MLflow or post‑hooks path a one‑line addition, giving you a seamless, production‑grade data capture pipeline.
+AgentScribe's Agno adapter is designed around Agno's native run outputs and trace exports, giving you a direct path from agent activity to training-ready records.

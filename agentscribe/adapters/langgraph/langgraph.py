@@ -238,7 +238,7 @@ def from_stream_events(
 			for message in _extract_messages(data):
 				append_unique_message(interaction, message_to_canonical(message))
 		elif mode == "messages" and include_message_chunks:
-			chunk = data[0] if isinstance(data, tuple) and data else data
+			chunk = data[0] if isinstance(data, (tuple, list)) and data else data
 			append_unique_message(
 				interaction,
 				message_to_canonical(chunk, metadata={"stream_mode": "messages", "stream_chunk": True}),

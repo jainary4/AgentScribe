@@ -364,9 +364,11 @@ class CrewAIAdapter(BaseAdapter):
         """
 
         try:
-            session_id = self._resolve_session_id(context)
+            captured = from_llm_call_context(context)
+            session_id = captured.session_id or self._resolve_session_id(context)
+            captured.session_id = session_id
             interaction = self._get_or_create_interaction(context, session_id)
-            self._append_messages_from_context(interaction, context)
+            self._merge_interaction(interaction, captured)
 
             if self._is_final_iteration(context):
                 self._finalise_and_flush(session_id)   # inherited from BaseAdapter
@@ -394,26 +396,11 @@ class CrewAIAdapter(BaseAdapter):
         """
 
         try:
-            session_id = self._resolve_session_id(context)
+            captured = from_tool_call_context(context)
+            session_id = captured.session_id or self._resolve_session_id(context)
+            captured.session_id = session_id
             interaction = self._get_or_create_interaction(context, session_id)
-
-            interaction.messages.append(
-                CanonicalMessage(
-                    role="tool_call",
-                    content="",
-                    tool_name=getattr(context, "tool_name", "unknown"),
-                    tool_args=getattr(context, "tool_input", {}),
-                )
-            )
-            result = getattr(context, "tool_result", "")
-            interaction.messages.append(
-                CanonicalMessage(
-                    role="tool_response",
-                    content=result if isinstance(result, str) else str(result),
-                    tool_name=getattr(context, "tool_name", "unknown"),
-                    tool_result=result if isinstance(result, str) else str(result),
-                )
-            )
+            self._merge_interaction(interaction, captured)
         except Exception as exc:
             _logger.error("Error in AgentScribe tool hook: %s", exc)
         return None
@@ -435,12 +422,16 @@ class CrewAIAdapter(BaseAdapter):
         e.g. ``"SupportCrew:SupportAgent:Handle password reset"``
         """
 
-        crew = getattr(context, "crew", None)
-        crew_name = getattr(crew, "name", None) if crew else None
-        agent = getattr(context, "agent", None)
-        agent_role = getattr(agent, "role", "unknown") if agent else "unknown"
-        task = getattr(context, "task", None)
-        task_desc = getattr(task, "description", "unknown") if task else "unknown"
+        explicit_session_id = _context_session_id(context)
+        if explicit_session_id is not None:
+            return explicit_session_id
+
+        crew = get_value(context, "crew", default=None)
+        crew_name = get_value(crew, "name", default=None) if crew else None
+        agent = get_value(context, "agent", default=None)
+        agent_role = get_value(agent, "role", "name", default="unknown") if agent else "unknown"
+        task = get_value(context, "task", default=None)
+        task_desc = get_value(task, "description", "name", default="unknown") if task else "unknown"
         if crew_name:
             return f"{crew_name}:{agent_role}:{task_desc}"
         return f"{agent_role}:{task_desc}"
@@ -460,12 +451,12 @@ class CrewAIAdapter(BaseAdapter):
         """
 
         if session_id not in self._pending:
-            crew = getattr(context, "crew", None)
-            crew_name = getattr(crew, "name", None) if crew else None
-            agent = getattr(context, "agent", None)
-            agent_role = getattr(agent, "role", None) if agent else None
-            task = getattr(context, "task", None)
-            task_desc = getattr(task, "description", None) if task else None
+            crew = get_value(context, "crew", default=None)
+            crew_name = get_value(crew, "name", default=None) if crew else None
+            agent = get_value(context, "agent", default=None)
+            agent_role = get_value(agent, "role", "name", default=None) if agent else None
+            task = get_value(context, "task", default=None)
+            task_desc = get_value(task, "description", "name", default=None) if task else None
 
             self._pending[session_id] = CanonicalInteraction(
                 source_framework="crewai",
@@ -477,6 +468,23 @@ class CrewAIAdapter(BaseAdapter):
                 },
             )
         return self._pending[session_id]
+
+    def _merge_interaction(self, target: CanonicalInteraction, source: CanonicalInteraction) -> None:
+        """Merge converter output into an in-progress live hook interaction."""
+
+        for message in source.messages:
+            append_unique_message(target, message)
+        target.metadata.update(compact_dict(source.metadata))
+        if source.agent:
+            target.agent = source.agent
+        if source.instantiation:
+            target.instantiation.update(source.instantiation)
+        if source.model and not target.model:
+            target.model = source.model
+        if source.token_usage:
+            target.token_usage.update(source.token_usage)
+        if source.spans:
+            target.spans.extend(source.spans)
 
     def _append_messages_from_context(self, interaction: CanonicalInteraction, context: Any) -> None:
 
@@ -533,11 +541,15 @@ class CrewAIAdapter(BaseAdapter):
         bool
         """
 
-        iterations = getattr(context, "iterations", 0)
-        max_iter = getattr(getattr(context, "agent", None), "max_iter", None)
-        if max_iter is not None and iterations >= max_iter:
-            return True
-        response = getattr(context, "response", "") or ""
+        iterations = get_value(context, "iterations", "iteration", default=0)
+        max_iter = get_value(get_value(context, "agent", default=None), "max_iter", default=None)
+        if max_iter is not None:
+            try:
+                if int(iterations or 0) >= int(max_iter):
+                    return True
+            except (TypeError, ValueError):
+                pass
+        response = get_value(context, "response", "output", "result", "raw", default="") or ""
         if "Final Answer:" in response:
             return True
         return False

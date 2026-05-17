@@ -1,82 +1,337 @@
-"""Agno adapter for AgentScribe.
+"""Agno adapter helpers.
 
-Captures agent interactions using Agno's native post‑hooks and tool hooks.
-No additional dependencies beyond ``agno`` are required.
-
-Usage (post‑hooks — recommended):
-    from agentscribe.adapters.agno import AgnoAdapter
-
-    adapter = AgnoAdapter(format="openai_chat", output="./data.jsonl")
-
-    agent = Agent(
-        model=OpenAIChat(id="gpt-4o"),
-        tools=[YFinanceTools(stock_price=True)],
-        post_hooks=[adapter.post_hook],   # captures full message history
-        tool_hooks=[adapter.tool_hook],   # captures individual tool calls
-    )
-    agent.print_response("What is the stock price of Apple?")
-    adapter.flush()  # optional — also auto‑flushed on garbage collection
-
-Alternative: MLflow autolog (requires ``mlflow>=3.3``)
-    import mlflow
-    mlflow.agno.autolog()
-    # AgentScribe's CLI can later convert MLflow traces to training data:
-    #   agentscribe convert agno-mlflow ./mlruns/ --format openai_chat --output ./data.jsonl
+Agno exposes useful data through ``RunOutput`` objects, post hooks, tool hooks,
+event streams, sessions, and OpenTelemetry-compatible traces. This module keeps
+those inputs duck-typed so AgentScribe can normalize saved exports without
+requiring Agno at import time.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Any, Optional
+import time
+from collections.abc import Iterable, Mapping
+from typing import Any
 
 from agentscribe.adapters.base import BaseAdapter
-from agentscribe.core.canonical import CanonicalInteraction, CanonicalMessage
+from agentscribe.core.canonical import CanonicalInteraction
 from agentscribe.core.formatter import Formatter
+
+from ..utils import (
+    InteractionCollector,
+    append_unique_message,
+    as_list,
+    build_metadata,
+    compact_dict,
+    get_value,
+    interaction_from_messages,
+    json_ready,
+    message_to_canonical,
+    object_to_dict,
+    resolve_identifier,
+    tool_call_message,
+    tool_response_message,
+)
 
 _logger = logging.getLogger("agentscribe.agno")
 
 
-class AgnoAdapter(BaseAdapter):
-    """Capture Agno agent interactions using post‑hooks.
+def _run_session_id(run_output: Any, *, fallback: Any = None) -> str | None:
+    """Resolve an Agno session id from a run-like object."""
 
-    Inherits buffering, formatting, and storage from :class:`BaseAdapter`.
+    return resolve_identifier(run_output, "session_id", "session") or (str(fallback) if fallback is not None else None)
+
+
+def _run_metadata(run_output: Any, *, metadata: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """Build compact Agno run metadata."""
+
+    return {
+        "source_shape": "run_output",
+        **build_metadata(
+            run_output,
+            fields={
+                "agent_name": ("agent_name", "agent", "name"),
+                "agent_id": ("agent_id",),
+                "run_id": ("run_id", "id"),
+                "user_id": ("user_id",),
+                "team_id": ("team_id",),
+            },
+        ),
+        **dict(metadata or {}),
+    }
+
+
+def _tool_execution_messages(tool: Any) -> list[Any]:
+    """Convert an Agno ToolExecution-like object into canonical tool messages."""
+
+    tool_name = get_value(tool, "tool_name", "name", "function_name", default=None)
+    tool_args = get_value(tool, "tool_args", "tool_input", "arguments", "args", "input", default=None)
+    tool_result = get_value(tool, "tool_result", "result", "output", "content", default=None)
+    tool_call_id = get_value(tool, "tool_call_id", "call_id", "id", default=None)
+    metadata = compact_dict(
+        {
+            "tool_class": tool.__class__.__name__,
+            "duration_ms": get_value(tool, "duration_ms", "duration", default=None),
+            "status": get_value(tool, "status", default=None),
+            "error": get_value(tool, "error", "exception", default=None),
+        }
+    )
+
+    messages: list[Any] = []
+    if tool_args is not None:
+        messages.append(
+            tool_call_message(
+                str(tool_name) if tool_name is not None else None,
+                tool_args,
+                tool_call_id=str(tool_call_id) if tool_call_id is not None else None,
+                metadata=metadata,
+            )
+        )
+    if tool_result is not None:
+        messages.append(
+            tool_response_message(
+                str(tool_name) if tool_name is not None else None,
+                tool_result,
+                tool_call_id=str(tool_call_id) if tool_call_id is not None else None,
+                metadata=metadata,
+            )
+        )
+    return messages
+
+
+def _run_tools(run_output: Any) -> list[Any]:
+    """Return tool executions from the common Agno run-output locations."""
+
+    tools = get_value(run_output, "tools", "tool_calls", "tool_executions", default=[])
+    return as_list(tools)
+
+
+def _run_metrics(run_output: Any) -> dict[str, Any]:
+    """Return JSON-ready Agno metrics or usage."""
+
+    metrics = object_to_dict(get_value(run_output, "metrics", "token_usage", "usage", default={}))
+    return compact_dict(metrics)
+
+
+def _run_model(run_output: Any) -> str | None:
+    """Resolve the model name from an Agno run output."""
+
+    model = get_value(run_output, "model", "model_id", default=None)
+    if model is None:
+        model = get_value(get_value(run_output, "model_provider", default=None), "id", "name", default=None)
+    return str(model) if model is not None else None
+
+
+def from_run_output(run_output: Any, *, metadata: Mapping[str, Any] | None = None) -> CanonicalInteraction:
+    """Normalize an Agno ``RunOutput`` or compatible mapping.
 
     Parameters
     ----------
-    format : str
-        Output format (``"openai_chat"``, ``"sharegpt"``, ``"alpaca"``, etc.).
-    output : str
-        File path or cloud URI (``s3://``, ``gs://``, ``az://``).
-    flush_interval : int
-        Number of completed interactions to buffer before writing to storage.
-        Use 0 to flush after every interaction.
+    run_output : Any
+        Agno run output object, JSON export, or compatible mapping.
+    metadata : Mapping[str, Any] | None
+        Optional metadata to merge into the canonical interaction.
 
-    Examples
-    --------
-    >>> from agentscribe.adapters.agno import AgnoAdapter
-    >>> from agno.agent import Agent
-    >>> from agno.models.openai import OpenAIChat
-    >>>
-    >>> adapter = AgnoAdapter(format="openai_chat", output="./agno_data.jsonl")
-    >>>
-    >>> agent = Agent(
-    ...     model=OpenAIChat(id="gpt-4o"),
-    ...     tools=[...],
-    ...     post_hooks=[adapter.post_hook],
-    ...     tool_hooks=[adapter.tool_hook],
-    ... )
-    >>> agent.print_response("Hello world")
-    >>> adapter.flush()
-
-    Notes
-    -----
-    - ``post_hook`` captures the complete ``RunOutput.messages`` list after each
-      agent run, including system, user, assistant, and tool messages.
-    - ``tool_hook`` captures individual tool calls with arguments and results.
-    - Both hooks can be used together; the adapter deduplicates tool messages.
-    - For production, mark the hook with ``@hook(run_in_background=True)`` to
-      avoid blocking the agent's response path (requires AgentOS).
+    Returns
+    -------
+    CanonicalInteraction
+        Interaction containing messages, tool executions, metrics, and run
+        provenance.
     """
+
+    messages = get_value(run_output, "messages", "chat_history", "conversation", default=[]) or []
+    run_id = get_value(run_output, "run_id", "id", default=None)
+    interaction = interaction_from_messages(
+        as_list(messages),
+        source_framework="agno",
+        session_id=_run_session_id(run_output, fallback=run_id),
+        run_id=str(run_id) if run_id is not None else None,
+        metadata=_run_metadata(run_output, metadata=metadata),
+    )
+
+    content = get_value(run_output, "content", "response", "output", default=None)
+    if content is not None and not interaction.messages:
+        interaction.add_message("assistant", content)
+
+    for tool in _run_tools(run_output):
+        for message in _tool_execution_messages(tool):
+            append_unique_message(interaction, message)
+
+    model = _run_model(run_output)
+    if model is not None:
+        interaction.model = model
+    token_usage = _run_metrics(run_output)
+    if token_usage:
+        interaction.token_usage = token_usage
+
+    interaction.instantiation = compact_dict(
+        {
+            "agent": build_metadata(
+                get_value(run_output, "agent", default=run_output),
+                fields={
+                    "name": ("agent_name", "name"),
+                    "id": ("agent_id", "id"),
+                    "model": ("model", "model_id"),
+                },
+            ),
+            "run": {
+                "run_id": run_id,
+                "session_id": get_value(run_output, "session_id", default=None),
+            },
+        }
+    )
+    return interaction
+
+
+def from_session(session: Any, *, metadata: Mapping[str, Any] | None = None) -> list[CanonicalInteraction]:
+    """Normalize an Agno session export into one interaction per run.
+
+    Parameters
+    ----------
+    session : Any
+        Session object or mapping containing ``runs``/``session_runs`` or a
+        message list.
+    metadata : Mapping[str, Any] | None
+        Optional metadata to merge into each interaction.
+
+    Returns
+    -------
+    list[CanonicalInteraction]
+        Normalized session interactions.
+    """
+
+    session_id = get_value(session, "session_id", "id", default=None)
+    session_metadata = {
+        "source_shape": "session",
+        **build_metadata(
+            session,
+            fields={
+                "agent_name": ("agent_name", "agent", "name"),
+                "agent_id": ("agent_id",),
+                "user_id": ("user_id",),
+            },
+        ),
+        **dict(metadata or {}),
+    }
+    runs = get_value(session, "runs", "session_runs", default=None)
+    if runs is None:
+        return [from_run_output(session, metadata=session_metadata)]
+
+    interactions: list[CanonicalInteraction] = []
+    for run in as_list(runs):
+        if isinstance(run, Mapping):
+            run_payload = {**run}
+            if session_id is not None:
+                run_payload.setdefault("session_id", session_id)
+            for key in ("agent_name", "agent_id", "user_id"):
+                value = get_value(session, key, default=None)
+                if value is not None:
+                    run_payload.setdefault(key, value)
+        else:
+            run_payload = run
+        interactions.append(from_run_output(run_payload, metadata=session_metadata))
+    return interactions
+
+
+def _event_type(event: Any) -> str:
+    return str(get_value(event, "event", "event_type", "type", default=event.__class__.__name__))
+
+
+def _messages_from_event(event: Any) -> list[Any]:
+    messages = get_value(event, "messages", "chat_history", default=None)
+    if messages is not None:
+        return as_list(messages)
+    message = get_value(event, "message", default=None)
+    return as_list(message) if message is not None else []
+
+
+def from_event_stream(
+    events: Iterable[Any],
+    *,
+    metadata: Mapping[str, Any] | None = None,
+    include_message_chunks: bool = False,
+) -> CanonicalInteraction:
+    """Normalize Agno event-stream payloads into one interaction.
+
+    Event payloads are preserved as spans. Complete messages and terminal
+    output are promoted into canonical messages.
+    """
+
+    interaction = CanonicalInteraction(
+        source_framework="agno",
+        metadata={"source_shape": "event_stream", **dict(metadata or {})},
+    )
+    for event in events:
+        event_type = _event_type(event)
+        lower_type = event_type.lower()
+        interaction.spans.append(
+            {
+                "kind": "agno.event",
+                "event_type": event_type,
+                "event": json_ready(object_to_dict(event) or str(event)),
+            }
+        )
+        session_id = get_value(event, "session_id", default=None)
+        if session_id is not None and interaction.session_id is None:
+            interaction.session_id = str(session_id)
+        run_id = get_value(event, "run_id", "id", default=None)
+        if run_id is not None and not interaction.run_id:
+            interaction.run_id = str(run_id)
+
+        for message in _messages_from_event(event):
+            message_metadata = {"event_type": event_type}
+            if "chunk" in lower_type:
+                message_metadata["stream_chunk"] = True
+            canonical = message_to_canonical(message, metadata=message_metadata)
+            if include_message_chunks or not canonical.metadata.get("stream_chunk"):
+                append_unique_message(interaction, canonical)
+
+        if "tool" in lower_type:
+            for message in _tool_execution_messages(event):
+                append_unique_message(interaction, message)
+        elif "complete" in lower_type or "end" in lower_type:
+            content = get_value(event, "content", "response", "output", default=None)
+            if content is not None:
+                append_unique_message(interaction, message_to_canonical({"role": "assistant", "content": content}))
+    return interaction
+
+
+def from_trace(trace: Any, *, metadata: Mapping[str, Any] | None = None) -> CanonicalInteraction:
+    """Normalize Agno AgentOS/MLflow/OpenTelemetry-style traces."""
+
+    from ..opentelemetry import from_trace as from_otel_trace
+
+    trace_payload = get_value(trace, "trace", default=trace)
+    interaction = from_otel_trace(trace_payload, source_framework="agno", metadata={"source_shape": "trace", **dict(metadata or {})})
+    trace_id = get_value(trace_payload, "trace_id", "traceId", "id", default=None)
+    if trace_id is not None:
+        interaction.trace_id = str(trace_id)
+    return interaction
+
+
+class AgnoTraceCollector(InteractionCollector):
+    """Collector for Agno run outputs, sessions, event streams, and traces."""
+
+    def __init__(self, *, format_name: str = "openai_chat", output_path: str | None = None) -> None:
+        super().__init__(source_framework="agno", format_name=format_name, output_path=output_path)
+
+    def record_run_output(self, run_output: Any) -> CanonicalInteraction:
+        return self.record(from_run_output(run_output))
+
+    def record_session(self, session: Any) -> list[CanonicalInteraction]:
+        interactions = from_session(session)
+        self.extend(interactions)
+        return interactions
+
+    def record_event_stream(self, events: Iterable[Any]) -> CanonicalInteraction:
+        return self.record(from_event_stream(events))
+
+    def record_trace(self, trace: Any) -> CanonicalInteraction:
+        return self.record(from_trace(trace))
+
+
+class AgnoAdapter(BaseAdapter):
+    """Capture Agno agent interactions using post hooks and optional tool hooks."""
 
     def __init__(
         self,
@@ -84,22 +339,8 @@ class AgnoAdapter(BaseAdapter):
         output: str = "./agentscribe_data.jsonl",
         flush_interval: int = 10,
     ) -> None:
-        # 1. Initialise the shared part (buffer, lock, formatter, etc.)
-        super().__init__(
-            format=format,
-            output=output,
-            flush_interval=flush_interval,
-        )
-
-        # 2. Track tool calls seen in tool_hook so we don't duplicate them
-        #    when post_hook also sees them in RunOutput.messages
-        self._seen_tool_calls: set[str] = set()
-
-        _logger.info("AgentScribe Agno adapter initialised.")
-
-    # ==================================================================
-    # POST‑HOOK  (primary capture – runs after every agent response)
-    # ==================================================================
+        super().__init__(format=format, output=output, flush_interval=flush_interval)
+        self._pending_tool_messages: list[Any] = []
 
     def post_hook(
         self,
@@ -108,360 +349,91 @@ class AgnoAdapter(BaseAdapter):
         session: Any = None,
         run_context: Any = None,
     ) -> None:
-        """Post‑hook for Agno agents.  Pass this to ``Agent(post_hooks=[...])``.
+        """Agno post hook. Pass this to ``Agent(post_hooks=[...])``."""
 
-        Called by Agno after the agent generates a response.  Receives the
-        full ``RunOutput`` object, which contains the complete message history.
-
-        Parameters
-        ----------
-        run_output : RunOutput
-            The output from the agent run.  Contains ``messages`` (list of
-            ``Message`` objects), ``content``, ``agent_name``, ``session_id``,
-            ``tools``, and more.
-        agent : Agent
-            Reference to the Agent instance.
-        session : Session, optional
-            The current agent session.
-        run_context : RunContext, optional
-            The current run context.
-
-        Notes
-        -----
-        This hook is called **once per agent.run() invocation** (not per LLM
-        call).  It captures the complete conversation in one interaction.
-
-        Example
-        -------
-        >>> agent = Agent(
-        ...     post_hooks=[adapter.post_hook],
-        ... )
-        >>> agent.print_response("What is AI?")
-        # post_hook fires automatically; data is buffered for writing
-        """
         try:
-            # ---- 1. Build a unique session identifier ----
-            session_id = self._resolve_session_id(run_output, agent)
-
-            # ---- 2. Create a CanonicalInteraction ----
-            interaction = CanonicalInteraction(
-                source_framework="agno",
-                session_id=session_id,
-                metadata={
-                    "agent_name": getattr(run_output, "agent_name", None)
-                                  or getattr(agent, "name", None),
-                    "agent_id": getattr(run_output, "agent_id", None),
-                    "run_id": getattr(run_output, "run_id", None),
-                    "model": getattr(run_output, "model", None),
-                    "user_id": getattr(run_output, "user_id", None),
-                },
+            metadata = compact_dict(
+                {
+                    "agent": object_to_dict(agent) or str(agent) if agent is not None else None,
+                    "session": object_to_dict(session) or str(session) if session is not None else None,
+                    "run_context": object_to_dict(run_context) or str(run_context) if run_context is not None else None,
+                }
             )
-
-            # ---- 3. Extract messages from RunOutput.messages ----
-            messages = getattr(run_output, "messages", None) or []
-            for msg in messages:
-                self._append_message(interaction, msg)
-
-            # ---- 4. If no messages were captured (edge case), extract from content ----
-            if not interaction.messages:
-                content = getattr(run_output, "content", None)
-                if content:
-                    interaction.messages.append(
-                        CanonicalMessage(
-                            role="assistant",
-                            content=str(content),
-                        )
-                    )
-
-            # ---- 5. Finalise immediately (Agno post‑hook = one complete run) ----
+            interaction = from_run_output(run_output, metadata=metadata)
+            if agent is not None and not interaction.metadata.get("agent_name"):
+                agent_name = get_value(agent, "name", default=None)
+                if agent_name is not None:
+                    interaction.metadata["agent_name"] = str(agent_name)
+            for message in self._pending_tool_messages:
+                append_unique_message(interaction, message)
+            self._pending_tool_messages.clear()
             self._finalise_one(interaction)
-
         except Exception as exc:
-            _logger.error("Error in AgentScribe Agno post‑hook: %s", exc)
-
-    # ==================================================================
-    # TOOL HOOK  (secondary capture – runs on every tool call)
-    # ==================================================================
+            _logger.error("Error in AgentScribe Agno post hook: %s", exc)
 
     def tool_hook(
         self,
         function_name: str,
         function_call: Any,
-        arguments: dict,
+        arguments: dict[str, Any],
     ) -> Any:
-        """Tool hook for Agno agents.  Pass this to ``Agent(tool_hooks=[...])``.
-
-        Called by Agno before a tool is executed.  Wraps the tool call to
-        capture its arguments and result.
-
-        Parameters
-        ----------
-        function_name : str
-            The name of the tool being called (e.g. ``"get_stock_price"``).
-        function_call : Callable
-            The actual tool function.
-        arguments : dict
-            The arguments being passed to the tool.
-
-        Returns
-        -------
-        Any
-            The result of calling ``function_call(**arguments)``.
-
-        Notes
-        -----
-        Because this hook wraps the tool call, it captures both the arguments
-        (before execution) and the result (after execution).  These are stored
-        in an internal buffer and merged into the next ``post_hook`` interaction
-        if they haven't already been captured via ``RunOutput.messages``.
-
-        Example
-        -------
-        >>> agent = Agent(
-        ...     tool_hooks=[adapter.tool_hook],
-        ... )
-        # Every tool call is now logged with arguments and results
-        """
-        import time
+        """Agno tool hook. Pass this to ``Agent(tool_hooks=[...])``."""
 
         start_time = time.time()
-
         try:
-            # Execute the actual tool
             result = function_call(**arguments)
-            duration = time.time() - start_time
-
-            # Store for later merging into the CanonicalInteraction
-            self._pending_tool_result = {
-                "tool_name": function_name,
-                "tool_args": arguments,
-                "tool_result": result,
-                "duration_ms": int(duration * 1000),
-            }
-
-            return result
-
         except Exception as exc:
-            duration = time.time() - start_time
-            _logger.error(
-                "Tool '%s' failed after %.2fs: %s",
-                function_name, duration, exc,
+            duration_ms = int((time.time() - start_time) * 1000)
+            self._pending_tool_messages.append(
+                tool_call_message(function_name, arguments)
             )
-            raise  # re‑raise so Agno can handle the error
+            self._pending_tool_messages.append(
+                tool_response_message(
+                    function_name,
+                    {"error": str(exc)},
+                    metadata={"duration_ms": duration_ms, "error": exc.__class__.__name__},
+                )
+            )
+            _logger.error("Agno tool %r failed after %sms: %s", function_name, duration_ms, exc)
+            raise
 
-    # ==================================================================
-    # INTERNAL HELPERS
-    # ==================================================================
-
-    def _resolve_session_id(self, run_output: Any, agent: Any) -> str:
-        """Build a stable session identifier from the run output and agent.
-
-        Parameters
-        ----------
-        run_output : RunOutput
-        agent : Agent
-
-        Returns
-        -------
-        str
-            e.g. ``"StockAgent:session_abc123:run_def456"``
-        """
-        agent_name = (
-            getattr(run_output, "agent_name", None)
-            or getattr(agent, "name", None)
-            or "unknown"
+        duration_ms = int((time.time() - start_time) * 1000)
+        self._pending_tool_messages.append(tool_call_message(function_name, arguments))
+        self._pending_tool_messages.append(
+            tool_response_message(function_name, result, metadata={"duration_ms": duration_ms})
         )
-        session_id = getattr(run_output, "session_id", None)
-        run_id = getattr(run_output, "run_id", None)
-
-        parts = [agent_name]
-        if session_id:
-            parts.append(session_id)
-        if run_id:
-            parts.append(run_id)
-        return ":".join(parts)
-
-    def _append_message(
-        self,
-        interaction: CanonicalInteraction,
-        msg: Any,
-    ) -> None:
-        """Convert an Agno ``Message`` object into a ``CanonicalMessage`` and
-        append it to the interaction.
-
-        Parameters
-        ----------
-        interaction : CanonicalInteraction
-            The interaction being built.
-        msg : Message
-            An Agno Message object with ``role`` and ``content`` attributes.
-        """
-        # Extract role and content from the Agno Message object
-        role = getattr(msg, "role", None)
-        if role is None:
-            # Fallback: try dict‑like access
-            role = msg.get("role", "unknown") if isinstance(msg, dict) else "unknown"
-
-        content = getattr(msg, "content", None)
-        if content is None and isinstance(msg, dict):
-            content = msg.get("content", "")
-
-        role = str(role).lower()
-        content = str(content) if content else ""
-
-        # Map Agno‑specific role names to canonical roles
-        if role in ("tool", "tool_call", "function_call"):
-            # This is a tool‑call message (agent decided to call a tool)
-            tool_name = getattr(msg, "tool_name", None) or "unknown"
-            tool_args = getattr(msg, "tool_args", None) or {}
-            interaction.messages.append(
-                CanonicalMessage(
-                    role="tool_call",
-                    content="",
-                    tool_name=tool_name,
-                    tool_args=tool_args,
-                )
-            )
-        elif role in ("tool_response", "tool_result", "function_result"):
-            # This is a tool‑response message (result from tool execution)
-            tool_name = getattr(msg, "tool_name", None) or "unknown"
-            tool_result = str(content) if content else ""
-            interaction.messages.append(
-                CanonicalMessage(
-                    role="tool_response",
-                    content=tool_result,
-                    tool_name=tool_name,
-                    tool_result=tool_result,
-                )
-            )
-        else:
-            # Standard roles: system, user, assistant
-            interaction.messages.append(
-                CanonicalMessage(role=role, content=content)
-            )
+        return result
 
     def _finalise_one(self, interaction: CanonicalInteraction) -> None:
-        """Finalise a single interaction immediately (used by post‑hook).
+        """Buffer one completed Agno interaction and flush when configured."""
 
-        Unlike the CrewAI adapter which waits for a final iteration signal,
-        Agno post‑hooks fire once per complete agent run, so we can finalise
-        immediately.
-
-        Parameters
-        ----------
-        interaction : CanonicalInteraction
-            The completed interaction to buffer and potentially flush.
-        """
         with self._lock:
             self._buffer.append(interaction)
-            if len(self._buffer) >= self._flush_interval:
+            if self._flush_interval <= 0 or len(self._buffer) >= self._flush_interval:
                 self._flush_buffer()
 
 
-# ======================================================================
-#  POST‑HOC PARSER  –  for CLI log conversion
-# ======================================================================
+def parse_agno_run_output(run_output: Any, format_name: str = "openai_chat") -> list[dict[str, Any]]:
+    """Backward-compatible formatted parser for saved Agno run outputs.
 
-def parse_agno_run_output(
-    run_output: Any,
-    format_name: str = "openai_chat",
-) -> list[dict[str, Any]]:
-    """Parse an Agno ``RunOutput`` object (or its JSON serialisation) into
-    formatted training records.
-
-    Useful for post‑hoc batch conversion when you have saved ``RunOutput``
-    objects from previous agent runs.
-
-    Parameters
-    ----------
-    run_output : RunOutput or dict
-        An Agno RunOutput object, or a dictionary with the same structure.
-    format_name : str
-        Desired output format.
-
-    Returns
-    -------
-    list[dict]
-        Formatted records ready for writing to JSONL.
-
-    Example
-    -------
-    >>> from agno.agent import Agent
-    >>> agent = Agent(model=...)
-    >>> run_output = agent.run("Hello")
-    >>> records = parse_agno_run_output(run_output, format_name="sharegpt")
-    >>> # records is a list of dicts ready for write_jsonl
+    New code should prefer :func:`from_run_output`, which returns a
+    ``CanonicalInteraction`` like the rest of the adapter packages.
     """
 
-    # If run_output is a dict, work with it directly; otherwise use getattr
-    if isinstance(run_output, dict):
-        messages = run_output.get("messages", [])
-        agent_name = run_output.get("agent_name", "")
-        session_id = run_output.get("session_id", "")
-        run_id = run_output.get("run_id", "")
-        model = run_output.get("model", "")
-        agent_id = run_output.get("agent_id", "")
-        user_id = run_output.get("user_id", "")
-    else:
-        messages = getattr(run_output, "messages", None) or []
-        agent_name = getattr(run_output, "agent_name", None) or ""
-        session_id = getattr(run_output, "session_id", None) or ""
-        run_id = getattr(run_output, "run_id", None) or ""
-        model = getattr(run_output, "model", None) or ""
-        agent_id = getattr(run_output, "agent_id", None) or ""
-        user_id = getattr(run_output, "user_id", None) or ""
-
-    # Build the canonical interaction
-    interaction = CanonicalInteraction(
-        source_framework="agno",
-        session_id=f"{agent_name}:{session_id}:{run_id}",
-        metadata={
-            "agent_name": agent_name,
-            "agent_id": agent_id,
-            "run_id": run_id,
-            "model": model,
-            "user_id": user_id,
-        },
-    )
-
-    for msg in messages:
-        if isinstance(msg, dict):
-            role = msg.get("role", "unknown")
-            content = msg.get("content", "")
-            tool_name = msg.get("tool_name")
-            tool_args = msg.get("tool_args")
-            tool_result = msg.get("tool_result")
-        else:
-            role = getattr(msg, "role", "unknown")
-            content = getattr(msg, "content", "")
-            tool_name = getattr(msg, "tool_name", None)
-            tool_args = getattr(msg, "tool_args", None)
-            tool_result = getattr(msg, "tool_result", None)
-
-        role = str(role).lower()
-
-        if role in ("tool", "tool_call", "function_call"):
-            interaction.messages.append(
-                CanonicalMessage(
-                    role="tool_call",
-                    content="",
-                    tool_name=tool_name or "unknown",
-                    tool_args=tool_args or {},
-                )
-            )
-        elif role in ("tool_response", "tool_result", "function_result"):
-            interaction.messages.append(
-                CanonicalMessage(
-                    role="tool_response",
-                    content=str(content) if content else "",
-                    tool_name=tool_name or "unknown",
-                    tool_result=str(tool_result) if tool_result else "",
-                )
-            )
-        else:
-            interaction.messages.append(
-                CanonicalMessage(role=role, content=str(content) if content else "")
-            )
-
     formatter = Formatter(format=format_name)
-    return [formatter.format_single(interaction)]
+    return [formatter.format_single(from_run_output(run_output))]
+
+
+AgnoHookAdapter = AgnoAdapter
+
+
+__all__ = [
+    "AgnoAdapter",
+    "AgnoHookAdapter",
+    "AgnoTraceCollector",
+    "from_event_stream",
+    "from_run_output",
+    "from_session",
+    "from_trace",
+    "parse_agno_run_output",
+]

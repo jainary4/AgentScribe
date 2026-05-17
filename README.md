@@ -42,11 +42,12 @@ AgentScribe provides native adapters for the following:
 
 | Framework | Integration Mechanism |
 |---|---|
-| **LangGraph** | Middleware |
-| **CrewAI** | After‑LLM‑Call Hooks |
-| **Agno** | MLflow autolog hooks |
-| **AutoGen (AG2)** | Runtime logging parser |
-| **Atomic Agents / Atoms SDK** | Loguru sink |
+| **LangGraph** | State and stream converters (`from_state`, `from_stream_events`) plus `LangGraphRecorder` |
+| **CrewAI** | Hook/event/output converters plus optional `CrewAIAdapter` live hooks |
+| **Agno** | Run output, session, event stream, and trace converters plus optional `AgnoAdapter` |
+| **AutoGen (AG2)** | Task result, chat history, and stream event converters |
+| **Atomic Agents / Atoms SDK** | Response, chat history, and log event converters |
+| **MCP** | JSON-RPC request/response converters for `tools/list` and `tools/call` |
 
 External observability platforms can be used as data sources via the CLI:
 
@@ -54,6 +55,8 @@ External observability platforms can be used as data sources via the CLI:
 |---|---|
 | **AgentOps** | REST API pull → canonical model → formatted dataset |
 | **MLflow** | Trace parsing from local or remote tracking servers |
+| **OpenTelemetry** | Span/trace export parsing |
+| **OpenInference** | OpenInference span/trace export parsing |
 
 ---
 
@@ -84,12 +87,17 @@ agentscribe/
 │   │   └── formatter.py          # Format converters (OpenAI, Alpaca, ShareGPT, etc.)
 │   ├── adapters/
 │   │   ├── __init__.py
-│   │   ├── langgraph.py          # LangGraph middleware adapter
-│   │   ├── crewai.py             # CrewAI hooks adapter
-│   │   ├── agno.py               # Agno/MLflow adapter
-│   │   ├── autogen.py            # AutoGen runtime log adapter
-│   │   ├── atomic_agents.py      # Atomic Agents / Atoms SDK Loguru adapter
-│   │   └── agentops.py           # AgentOps API adapter (Mode B)
+│   │   ├── langgraph/            # LangGraph state/stream converters and recorder
+│   │   ├── crewai/               # CrewAI hook/event/output converters and adapter
+│   │   ├── agno/                 # Agno run/session/event/trace converters and adapter
+│   │   ├── autogen/              # AutoGen and AG2 converters
+│   │   ├── atomic_agents/        # Atomic Agents converters and collector
+│   │   ├── mcp/                  # Model Context Protocol JSON-RPC converters
+│   │   ├── agentops/             # AgentOps trace/event converters
+│   │   ├── mlflow/               # MLflow trace converters
+│   │   ├── opentelemetry/        # OpenTelemetry span/trace converters
+│   │   ├── openinference/        # OpenInference compatibility converters
+│   │   └── utils/                # Shared adapter normalization and collector utilities
 │   ├── storage.py                # Multi‑backend storage writer (local, S3, GCS, Azure)
 │   └── cli.py                    # CLI entry point (Click/Typer)
 ├── pyproject.toml                # Build configuration and dependencies
@@ -103,7 +111,7 @@ agentscribe/
 - **`formatter.py`** – Takes canonical interactions and serialises them into the target fine‑tuning format. Supports OpenAI chat, Alpaca, ShareGPT, prompt‑completion, and preference formats.
 - **`storage.py`** – Handles writing formatted data to local files or cloud object stores. Provides a uniform `Path`‑like interface for all backends.
 - **`cli.py`** – Implements the `agentscribe` terminal command, allowing users to convert log files or external platform exports into datasets without writing any Python.
-- **Adapters (`adapters/*.py`)** – Framework‑specific code that extracts conversation data from each agent runtime and populates a `CanonicalInteraction`. Each adapter knows the exact hook, middleware, or log parser to use for its framework.
+- **Adapters (`adapters/<framework>/`)** – Framework‑specific packages that expose duck‑typed `from_*` converters returning `CanonicalInteraction`. Some packages also expose live capture helpers such as `CrewAIAdapter`, `AgnoAdapter`, `LangGraphRecorder`, or framework-specific collectors.
 
 ---
 
@@ -138,7 +146,7 @@ Convert external logs or exported platform traces into a fine‑tuning dataset.
 agentscribe convert <source> <input> --format <format> --output <path>
 ```
 
-- `<source>` – The source type. One of: `crewai`, `langgraph`, `agno`, `autogen`, `atomic`, `agentops`, `mlflow`, or `auto` for auto‑detection.
+- `<source>` – The source type. One of: `crewai`, `langgraph`, `agno`, `autogen`, `ag2`, `atomic`, `atomic_agents`, `agentops`, `mlflow`, `opentelemetry`, `openinference`, `mcp`, or `auto` for auto‑detection.
 - `<input>` – Path to the log file, directory, or API key file (for AgentOps).
 - `--format` – Target dataset format. Options: `openai_chat`, `alpaca`, `sharegpt`, `prompt_completion`, `preference`. Default: `openai_chat`.
 - `--output` – Destination path (local or cloud URI).

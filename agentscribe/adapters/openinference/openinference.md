@@ -31,7 +31,7 @@ Use `from_spans()` when your export already consists of a span list. This is com
 
 ### 2.3 Compatibility package - simplest import path
 
-The `agentscribe.adapters.openinference` package re-exports the OpenTelemetry parsing helpers so OpenInference-specific code can import a dedicated adapter package without duplicating the parser implementation.
+The `agentscribe.adapters.openinference` package wraps the OpenTelemetry parsing helpers so OpenInference-specific code can import a dedicated adapter package without duplicating the parser implementation. Direct Python imports preserve `openinference` as the source label by default.
 
 ---
 
@@ -44,7 +44,7 @@ AgentScribe uses OpenInference as a post-hoc trace source:
 | **Python conversion** | Convert OpenInference trace objects or span lists directly in code. | Call `from_trace()` or `from_spans()`. |
 | **Post-hoc CLI** | Convert saved OpenInference JSON or JSONL exports. | Run `agentscribe convert openinference <file> --format <fmt> --output <path>`. |
 
-When using the CLI, AgentScribe preserves `openinference` as the source label in the resulting canonical interaction metadata.
+When using either the Python API or the CLI, AgentScribe preserves `openinference` as the source label in the resulting canonical interaction metadata.
 
 ---
 
