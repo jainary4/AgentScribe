@@ -4,6 +4,7 @@ import agentscribe.adapters.agno as agno
 
 
 def test_agno_package_reexports_public_api_and_alias() -> None:
+    
     assert set(agno.__all__) == {
         "AgnoAdapter",
         "AgnoHookAdapter",
