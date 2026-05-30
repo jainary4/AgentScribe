@@ -1,9 +1,27 @@
-"""Agno adapter helpers.
+"""Agno adapter for AgentScribe.
 
-Agno exposes useful data through ``RunOutput`` objects, post hooks, tool hooks,
-event streams, sessions, and OpenTelemetry-compatible traces. This module keeps
-those inputs duck-typed so AgentScribe can normalize saved exports without
-requiring Agno at import time.
+Captures agent interactions using Agno's native post‑hooks and tool hooks.
+No additional dependencies beyond ``agno`` are required.
+
+Usage (post‑hooks — recommended):
+    from agentscribe.adapters.agno import AgnoAdapter
+
+    adapter = AgnoAdapter(format="openai_chat", output="./data.jsonl")
+
+    agent = Agent(
+        model=OpenAIChat(id="gpt-4o"),
+        tools=[YFinanceTools(stock_price=True)],
+        post_hooks=[adapter.post_hook],   # captures full message history
+        tool_hooks=[adapter.tool_hook],   # captures individual tool calls
+    )
+    agent.print_response("What is the stock price of Apple?")
+    adapter.flush()  # optional — also auto‑flushed on garbage collection
+
+Alternative: MLflow autolog (requires ``mlflow>=3.3``)
+    import mlflow
+    mlflow.agno.autolog()
+    # AgentScribe's CLI can later convert MLflow traces to training data:
+    #   agentscribe convert agno-mlflow ./mlruns/ --format openai_chat --output ./data.jsonl
 """
 
 from __future__ import annotations
