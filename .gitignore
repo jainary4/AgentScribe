@@ -44,6 +44,10 @@ logs/
 tmp/
 temp/
 
+# Generated training data from e2e/demo runs (regenerated, never committed)
+agno_training.jsonl
+*_training.jsonl
+
 # Notebook and REPL checkpoints
 .ipynb_checkpoints/
 

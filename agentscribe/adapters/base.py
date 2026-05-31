@@ -104,7 +104,7 @@ class BaseAdapter:
 
     def flush(self) -> int:
 
-         """Write all buffered interactions to storage immediately.
+        """Write all buffered interactions to storage immediately.
 
         Returns
         -------
@@ -123,7 +123,7 @@ class BaseAdapter:
 
     def __enter__(self):
 
-          """Enter a ``with`` block — no special setup needed."""
+        """Enter a ``with`` block — no special setup needed."""
 
         return self
 
@@ -136,6 +136,6 @@ class BaseAdapter:
          with SomeAdapter(output="./data.jsonl") as adapter:
             crew.kickoff()
             # flush() is called automatically here
-        """"
-        
+        """
+
         self.flush()

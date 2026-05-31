@@ -1,6 +1,8 @@
 """Agno adapter package."""
 
 from .agno import (
+    AgnoAdapter,
+    AgnoHookAdapter,
     AgnoTraceCollector,
     from_event_stream,
     from_run_output,

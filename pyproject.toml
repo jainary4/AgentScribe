@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agentscribe"
-version = "0.1.0"
+version = "0.2.0"
 description = "Capture agent conversations and convert them into fine-tuning datasets"
 requires-python = ">=3.10"
 license = {text = "MIT"}
@@ -42,3 +42,8 @@ agentscribe = "agentscribe.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["agentscribe"]
+
+[tool.pytest.ini_options]
+markers = [
+    "live: real framework + network + API key required (deselected by default; run with -m live)",
+]
