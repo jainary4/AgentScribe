@@ -31,10 +31,11 @@ def test_cli_convert_jsonl_openai_chat_to_sharegpt_local_file(tmp_path) -> None:
 
     assert result.exit_code == 0, result.output
     assert "Wrote 1 records" in result.output
+    # ShareGPT keeps the system prompt in its own `system` field and out of the
+    # `conversations` list (LLaMA-Factory convention) rather than duplicating it.
     assert read_jsonl_file(output_path) == [
         {
             "conversations": [
-                {"from": "system", "value": "Be brief."},
                 {"from": "human", "value": "Hello"},
                 {"from": "gpt", "value": "Hi"},
             ],

@@ -14,10 +14,11 @@ import click
 
 from agentscribe.adapters.utils.registry import adapter_record_to_interactions as dispatch_adapter_record
 from agentscribe.core.canonical import CanonicalInteraction
+from agentscribe.core.formatter import FormatValidationError, available_formats, format_messages
 from agentscribe.storage import StorageError, StorageURI, get_backend, read_jsonl, write_jsonl
 
 
-FORMATS = ("openai_chat", "alpaca", "sharegpt", "prompt_completion", "preference")
+FORMATS = tuple(available_formats())
 LOCAL_SOURCES = ("auto", "json", "jsonl", "canonical", "openai_chat", "sharegpt", "alpaca", "prompt_completion", "preference")
 ADAPTER_SOURCES = (
 	"crewai",
@@ -49,19 +50,6 @@ SHAREGPT_TO_CANONICAL = {
 	"function_call": "tool_call",
 	"observation": "tool_response",
 }
-CANONICAL_TO_SHAREGPT = {
-	"system": "system",
-	"user": "human",
-	"assistant": "gpt",
-	"tool_call": "function_call",
-	"tool_response": "observation",
-	"tool": "observation",
-}
-OPENAI_ROLE_MAP = {
-	"tool_response": "tool",
-	"tool_call": "assistant",
-}
-OPENAI_MESSAGE_EXTRAS = {"name", "tool_call_id", "tool_calls", "function_call", "weight"}
 
 
 def _package_version() -> str:
@@ -426,115 +414,20 @@ def _prompt_record_to_messages(record: Mapping[str, Any]) -> list[dict[str, Any]
 
 def _format_messages(messages: list[dict[str, Any]], format_name: str) -> Mapping[str, Any]:
 
-	"""Route a canonical message list to the appropriate output formatter based on the chosen format name
-	Usage: Called by _format_records after normalizing a record"""
+	"""Route a canonical message list to the shared formatter for the chosen format.
 
-	#simple dispatcher that calls the appropriate conversion function
-	if format_name == "openai_chat":
-		return {"messages": [_to_openai_message(message) for message in messages]}
-	if format_name == "sharegpt":
-		return _to_sharegpt(messages)
-	if format_name == "alpaca":
-		return _to_alpaca(messages)
-	if format_name == "prompt_completion":
-		return _to_prompt_completion(messages)
-	if format_name == "preference":
-		return _to_preference(messages)
-	raise click.ClickException(f"Unsupported format `{format_name}`")
+	Usage: Called by _format_records after normalizing a record. Delegates to
+	agentscribe.core.formatter so the CLI and the adapters share one spec-compliant
+	implementation."""
 
-
-def _to_openai_message(message: Mapping[str, Any]) -> dict[str, Any]:
-
-	"""Convert a single canonical message into an OpenAI‑compatible message dict
-	Usage: Called by _format_messages for openai_chat."""
-
-	role = OPENAI_ROLE_MAP.get(str(message["role"]), str(message["role"]))
-	result = {"role": role, "content": message.get("content", "")}
-	for key in OPENAI_MESSAGE_EXTRAS:
-		if key in message:
-			result[key] = message[key]
-	return result
-
-
-def _to_sharegpt(messages: list[dict[str, Any]]) -> Mapping[str, Any]:
-
-	"""Convert a list of canonical messages into a ShareGPT‑style record
-	Usage:Called by _format_messages for sharegpt."""
-
-	conversations = []
-	system = ""
-	for message in messages:
-		role = str(message["role"])
-		if role == "system" and not system:
-			system = _coerce_text(message.get("content", ""))
-		conversations.append(
-			{
-				"from": CANONICAL_TO_SHAREGPT.get(role, role),
-				"value": _coerce_text(message.get("content", "")),
-			}
-		)
-	return {"conversations": conversations, "system": system}
-
-
-def _to_alpaca(messages: list[dict[str, Any]]) -> Mapping[str, Any]:
-
-	"""Convert a list of canonical messages to an Alpaca record (instruction, output, optional history)
-	Usage: Called by _format_messages for alpaca"""
-
-	user_messages = [message for message in messages if message["role"] == "user"]
-	assistant_messages = [message for message in messages if message["role"] == "assistant"]
-	system_message = next((message for message in messages if message["role"] == "system"), None)
-	#Separate messages into user and assistant lists, find the first system message if any
-
-	instruction = _coerce_text(user_messages[-1].get("content", "")) if user_messages else ""
-	if system_message:
-		instruction = f"{_coerce_text(system_message.get('content', ''))}\n\n{instruction}".strip()
-	
-	#The last user message becomes the main instruction. If there's a system message, prepend it with a double newline
-
-	result: dict[str, Any] = {
-		"instruction": instruction,
-		"input": "",
-		"output": _coerce_text(assistant_messages[-1].get("content", "")) if assistant_messages else "",
-	}
-	#Build the core Alpaca dict. input is left empty
-	history_pairs = list(zip(user_messages[:-1], assistant_messages[:-1]))
-	if history_pairs:
-		result["history"] = [
-			[_coerce_text(user_message.get("content", "")), _coerce_text(assistant_message.get("content", ""))]
-			for user_message, assistant_message in history_pairs
-		]
-	return result
-
-
-def _to_prompt_completion(messages: list[dict[str, Any]]) -> Mapping[str, Any]:
-
-	""" Convert a canonical message list into a simple prompt‑completion pair
-	Usage: Called by _format_messages for prompt_completion"""
-
-	#Find the first user message and the last assistant message. Return them as a prompt/completion dict
-	user_message = next((message for message in messages if message["role"] == "user"), None)
-	assistant_message = next((message for message in reversed(messages) if message["role"] == "assistant"), None)
-	return {
-		"prompt": _coerce_text(user_message.get("content", "")) if user_message else "",
-		"completion": _coerce_text(assistant_message.get("content", "")) if assistant_message else "",
-	}
-
-
-def _to_preference(messages: list[dict[str, Any]]) -> Mapping[str, Any]:
-
-	"""Convert a canonical message list into a DPO preference record with an empty rejected field
-	Usage: Called by _format_messages for preference"""
-
-	user_content = " ".join(_coerce_text(message.get("content", "")) for message in messages if message["role"] == "user")
-	assistant_content = " ".join(
-		_coerce_text(message.get("content", "")) for message in messages if message["role"] == "assistant"
-	)
-	return {
-		"prompt": [{"role": "user", "content": user_content}],
-		"chosen": [{"role": "assistant", "content": assistant_content}],
-		"rejected": [{"role": "assistant", "content": ""}],
-	}
+	try:
+		return format_messages(messages, format_name)
+	except FormatValidationError as exc:
+		raise click.ClickException(str(exc)) from exc
+	except ValueError as exc:
+		raise click.ClickException(
+			f"Unsupported format `{format_name}`. Supported: {', '.join(available_formats())}"
+		) from exc
 
 
 def _write_stdout(records: Iterable[Mapping[str, Any]]) -> int:

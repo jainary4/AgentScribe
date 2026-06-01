@@ -34,6 +34,25 @@ def _require_key():
         pytest.skip("OPENROUTER_API_KEY not set")
 
 
+def _emit(label, records):
+    """Emit the formatted dataset so a live run actually shows its output.
+
+    Prints each record as a JSONL line (visible with ``pytest -s``). If
+    ``AGENTSCRIBE_LIVE_OUTPUT_DIR`` is set, also writes ``<label>.jsonl`` there
+    so the formatted output can be inspected after the run.
+    """
+    print(f"\n----- formatted output: {label} -----")
+    for record in records:
+        print(json.dumps(record, ensure_ascii=False))
+    print(f"----- end {label} -----")
+
+    out_dir = os.getenv("AGENTSCRIBE_LIVE_OUTPUT_DIR")
+    if out_dir:
+        path = os.path.join(out_dir, f"{label}.jsonl")
+        write_jsonl(path, records)
+        print(f"(wrote {path})")
+
+
 @pytest.fixture(scope="module")
 def agent():
     _require_key()
@@ -57,15 +76,19 @@ def test_run_output_captures_exchange_and_writes_openai_chat_jsonl(agent, tmp_pa
     assistant = [m for m in interaction.messages if m.role == "assistant"]
     assert assistant[-1].content.strip(), "assistant content is empty (run likely failed)"
 
-    # Full pipeline: format -> write -> read back from disk.
-    record = Formatter(format="openai_chat").format_single(interaction)
+    # Full pipeline: format -> write -> read back from disk. strict=True asserts
+    # the record is OpenAI fine-tuning spec-compliant on the way out.
+    record = Formatter(format="openai_chat", strict=True).format_single(interaction)
     output = tmp_path / "agno_training.jsonl"
     write_jsonl(str(output), [record])
 
     lines = output.read_text().splitlines()
     assert len(lines) == 1
     written = json.loads(lines[0])
-    assert written["messages"][0]["role"] == "user"
+    _emit("agno_training", [written])
+    roles = [m["role"] for m in written["messages"]]
+    assert set(roles) <= {"system", "user", "assistant", "tool"}, roles
+    assert "user" in roles
     assert any(m["role"] == "assistant" and (m.get("content") or "").strip() for m in written["messages"])
 
 
@@ -81,10 +104,25 @@ def test_weather_run_captures_tool_call(search_agent, tmp_path):
     if not succeeded:
         pytest.skip("DuckDuckGo returned no results (rate-limited/blocked)")
 
-    # A real search ran: verify the tool call survives the full pipeline to JSONL.
-    record = Formatter(format="openai_chat").format_single(interaction)
+    # A real search ran: verify the tool call survives the full pipeline to JSONL
+    # as a spec-compliant structured tool call (assistant.tool_calls + tool role),
+    # not as the legacy flat tool_call/tool_response pseudo-roles.
+    record = Formatter(format="openai_chat", strict=True).format_single(interaction)
     output = tmp_path / "agno_weather.jsonl"
     write_jsonl(str(output), [record])
 
     written = json.loads(output.read_text().splitlines()[0])
-    assert any(m["role"] in ("tool_call", "tool_response") for m in written["messages"])
+    _emit("agno_weather", [written])
+    messages = written["messages"]
+    assert set(m["role"] for m in messages) <= {"system", "user", "assistant", "tool"}
+
+    tool_calls = [tc for m in messages if m["role"] == "assistant" for tc in m.get("tool_calls", [])]
+    assert tool_calls, "no structured assistant tool_calls captured"
+    call = tool_calls[0]
+    assert call["type"] == "function" and call["function"]["name"]
+    json.loads(call["function"]["arguments"])  # arguments serialize as valid JSON
+
+    tool_msgs = [m for m in messages if m["role"] == "tool"]
+    assert tool_msgs and all(m.get("tool_call_id") for m in tool_msgs)
+    call_ids = {tc["id"] for tc in tool_calls}
+    assert any(m["tool_call_id"] in call_ids for m in tool_msgs), "tool result not linked to a tool_call id"

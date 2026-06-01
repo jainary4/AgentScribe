@@ -140,6 +140,26 @@ def _run_model(run_output: Any) -> str | None:
     return str(model) if model is not None else None
 
 
+def _message_tool_calls(raw_message: Any):
+    """Yield ``(name, arguments, call_id)`` for tool calls embedded in a message.
+
+    Agno's run messages already carry the assistant's structured ``tool_calls``
+    (OpenAI shape). Extracting them into canonical ``tool_call`` messages keeps
+    the call→result linkage that ``message_to_canonical`` would otherwise drop.
+    """
+
+    for call in as_list(get_value(raw_message, "tool_calls", "function_calls", default=None) or []):
+        function = get_value(call, "function", default=call)
+        name = get_value(function, "name", "tool_name", default=None)
+        arguments = get_value(function, "arguments", "args", "tool_args", default=None)
+        call_id = get_value(call, "id", "tool_call_id", "call_id", default=None)
+        yield (
+            str(name) if name is not None else None,
+            arguments,
+            str(call_id) if call_id is not None else None,
+        )
+
+
 def from_run_output(run_output: Any, *, metadata: Mapping[str, Any] | None = None) -> CanonicalInteraction:
     """Normalize an Agno ``RunOutput`` or compatible mapping.
 
@@ -160,20 +180,46 @@ def from_run_output(run_output: Any, *, metadata: Mapping[str, Any] | None = Non
     messages = get_value(run_output, "messages", "chat_history", "conversation", default=[]) or []
     run_id = get_value(run_output, "run_id", "id", default=None)
     interaction = interaction_from_messages(
-        as_list(messages),
+        [],
         source_framework="agno",
         session_id=_run_session_id(run_output, fallback=run_id),
         run_id=str(run_id) if run_id is not None else None,
         metadata=_run_metadata(run_output, metadata=metadata),
     )
 
+    # Agno's run messages are already an ordered OpenAI transcript. Walk them in
+    # order, expanding each assistant turn's embedded tool_calls into canonical
+    # tool_call messages (with their ids) and rebuilding tool results so the
+    # call→result link survives. ``saw_tool`` records whether the transcript
+    # already covered the tool interactions.
+    saw_tool = False
+    for raw_message in as_list(messages):
+        canonical = message_to_canonical(raw_message)
+        interaction.messages.append(canonical)
+        if canonical.role == "assistant":
+            for name, arguments, call_id in _message_tool_calls(raw_message):
+                interaction.messages.append(tool_call_message(name, arguments, tool_call_id=call_id))
+                saw_tool = True
+        elif canonical.role == "tool_response":
+            # Replace the plain conversion with one that carries the tool_call_id.
+            tool_call_id = get_value(raw_message, "tool_call_id", "call_id", "id", default=None)
+            interaction.messages[-1] = tool_response_message(
+                canonical.tool_name,
+                canonical.tool_result if canonical.tool_result is not None else canonical.content,
+                tool_call_id=str(tool_call_id) if tool_call_id is not None else None,
+            )
+            saw_tool = True
+
     content = get_value(run_output, "content", "response", "output", default=None)
     if content is not None and not interaction.messages:
-        interaction.add_message("assistant", content)
+        interaction.messages.append(message_to_canonical({"role": "assistant", "content": content}))
 
-    for tool in _run_tools(run_output):
-        for message in _tool_execution_messages(tool):
-            append_unique_message(interaction, message)
+    # Only fall back to the tools list when the transcript did not already carry
+    # the tool interactions, to avoid duplicating them.
+    if not saw_tool:
+        for tool in _run_tools(run_output):
+            for message in _tool_execution_messages(tool):
+                append_unique_message(interaction, message)
 
     model = _run_model(run_output)
     if model is not None:

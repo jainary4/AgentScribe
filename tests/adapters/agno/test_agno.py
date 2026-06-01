@@ -11,6 +11,7 @@ from agentscribe.adapters.agno import (
     from_trace,
     parse_agno_run_output,
 )
+from agentscribe.core.formatter import Formatter
 
 
 def test_from_run_output_normalizes_messages_tools_metrics_and_model() -> None:
@@ -47,6 +48,77 @@ def test_from_run_output_uses_assistant_content_when_history_is_empty() -> None:
 
     assert interaction.session_id == "run-2"
     assert [(message.role, message.content) for message in interaction.messages] == [("assistant", "final answer")]
+
+
+def test_from_run_output_expands_assistant_tool_calls_and_dedupes_tools_list() -> None:
+    # Mirrors a real Agno RunOutput: `messages` is already a full OpenAI
+    # transcript (assistant tool_calls + tool results), and `tools` duplicates
+    # those same executions. The transcript must win and the duplicate `tools`
+    # list must be ignored so the call->result linkage is preserved exactly once.
+    run_output = {
+        "run_id": "run-3",
+        "messages": [
+            {"role": "user", "content": "Weather in Toronto?"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "call_A", "type": "function",
+                     "function": {"name": "web_search", "arguments": '{"query": "weather Toronto"}'}}
+                ],
+            },
+            {"role": "tool", "tool_name": "web_search", "tool_call_id": "call_A", "content": "12C and sunny"},
+            {"role": "assistant", "content": "It's 12C and sunny in Toronto."},
+        ],
+        "tools": [
+            {"tool_name": "web_search", "tool_call_id": "call_A",
+             "tool_args": {"query": "weather Toronto"}, "tool_result": "12C and sunny"},
+        ],
+    }
+
+    interaction = from_run_output(run_output)
+
+    # Assistant tool_calls are expanded into canonical tool_call messages and the
+    # duplicate `tools` list is not appended a second time.
+    assert [m.role for m in interaction.messages] == [
+        "user",
+        "assistant",
+        "tool_call",
+        "tool_response",
+        "assistant",
+    ]
+    tool_calls = [m for m in interaction.messages if m.role == "tool_call"]
+    assert len(tool_calls) == 1
+    assert tool_calls[0].tool_args["_agentscribe"]["tool_call_id"] == "call_A"
+
+
+def test_from_run_output_tool_call_survives_to_spec_compliant_openai_chat() -> None:
+    run_output = {
+        "messages": [
+            {"role": "user", "content": "Weather in Toronto?"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "call_A", "type": "function",
+                     "function": {"name": "web_search", "arguments": '{"query": "weather Toronto"}'}}
+                ],
+            },
+            {"role": "tool", "tool_name": "web_search", "tool_call_id": "call_A", "content": "12C and sunny"},
+            {"role": "assistant", "content": "It's 12C and sunny in Toronto."},
+        ],
+    }
+
+    # strict=True asserts OpenAI fine-tuning spec compliance (valid roles,
+    # structured tool_calls, every tool message linked to a real tool_call id).
+    record = Formatter("openai_chat", strict=True).format_single(from_run_output(run_output))
+    messages = record["messages"]
+
+    assert {m["role"] for m in messages} <= {"system", "user", "assistant", "tool"}
+    call_ids = {tc["id"] for m in messages if m["role"] == "assistant" for tc in m.get("tool_calls", [])}
+    assert call_ids == {"call_A"}
+    tool_messages = [m for m in messages if m["role"] == "tool"]
+    assert len(tool_messages) == 1 and tool_messages[0]["tool_call_id"] == "call_A"
 
 
 def test_from_session_splits_runs_and_inherits_session_fields() -> None:
