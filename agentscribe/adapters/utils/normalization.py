@@ -44,13 +44,19 @@ def json_ready(value: Any) -> Any:
     if hasattr(value, "model_dump"):
         try:
             return json_ready(value.model_dump(mode="json"))
-        except TypeError:
-            return json_ready(value.model_dump())
+        except Exception:
+            try:
+                return json_ready(value.model_dump())
+            except Exception:
+                return str(value)
     if hasattr(value, "to_dict"):
         try:
             return json_ready(value.to_dict())
-        except TypeError:
+        except Exception:
             pass
+    # Last resort: stringify anything not JSON-native so capture never crashes.
+    if value is not None and not isinstance(value, (str, int, float, bool)):
+        return str(value)
     return value
 
 
@@ -175,10 +181,10 @@ def object_to_dict(value: Any) -> dict[str, Any]:
         if callable(method):
             try:
                 payload = method(mode="json") if method_name == "model_dump" else method()
-            except TypeError:
+            except Exception:
                 try:
                     payload = method()
-                except TypeError:
+                except Exception:
                     continue
             if isinstance(payload, Mapping):
                 return dict(payload)
