@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import threading
 from typing import Any
+import atexit
 
 from agentscribe.core.canonical import CanonicalInteraction
 from agentscribe.core.formatter import Formatter
@@ -43,6 +44,7 @@ class BaseAdapter:
         self._lock = threading.Lock()
         self._pending: dict[str, CanonicalInteraction] = {}
         self._formatter = Formatter(format=self._format)
+        atexit.register(self._safe_flush)
 
 
     def _finalise_and_flush(self, session_id: str) -> None:
@@ -120,6 +122,14 @@ class BaseAdapter:
         """
         with self._lock:
             return self._flush_buffer()
+
+        
+    def _safe_flush(self) -> None:
+        """Flush without raising — safe to call during atexit / teardown."""
+        try:
+            self.flush()
+        except Exception:
+            pass
 
     def __enter__(self):
 
