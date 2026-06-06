@@ -553,6 +553,22 @@ class CrewAIAdapter(BaseAdapter):
         if "Final Answer:" in response:
             return True
         return False
+        
+    def flush(self) -> int:
+        """Flush like BaseAdapter, but first finalize any in-progress interactions.
+
+        CrewAI delivers a conversation as fragments across many hook fires, so an
+        interaction sits in ``self._pending`` until the run's completion is
+        detected. If that detection doesn't fire (e.g. the ``"Final Answer:"``
+        heuristic fails on a CrewAI version), the interaction would otherwise be
+        stuck in ``_pending`` forever and never written. Here we move every
+        pending interaction into the buffer before flushing, so flush() / the
+        ``with`` block / the atexit net never lose in-progress data.
+        """
+        with self._lock:
+            for session_id in list(self._pending.keys()):
+                self._buffer.append(self._pending.pop(session_id))
+            return self._flush_buffer()
 
 
 __all__ = [
