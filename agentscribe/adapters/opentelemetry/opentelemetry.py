@@ -59,8 +59,11 @@ def _message_from_value(value: Any, *, default_role: str) -> list[CanonicalMessa
     parsed = parse_jsonish(value)
     if isinstance(parsed, list):
         return [message_to_canonical(item, default_role=default_role) for item in parsed]
-    if isinstance(parsed, Mapping) and "messages" in parsed:
-        return [message_to_canonical(item, default_role=default_role) for item in as_list(parsed["messages"])]
+    if isinstance(parsed, Mapping):
+        if "messages" in parsed:
+            return [message_to_canonical(item, default_role=default_role) for item in as_list(parsed["messages"])]
+        if "role" in parsed or "content" in parsed:          # <-- NEW: a single message dict
+            return [message_to_canonical(parsed, default_role=default_role)]
     return [message_to_canonical({"role": default_role, "content": parsed})]
 
 
