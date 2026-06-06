@@ -437,9 +437,15 @@ def normalize_record(record: Any) -> Any:
 	"""Normalize common model objects into JSON-serializable structures."""
 
 	if hasattr(record, "model_dump"):
-		return record.model_dump(mode="json")
+		try:
+			return record.model_dump(mode="json")
+		except Exception:
+			return str(record)
 	if hasattr(record, "to_dict"):
-		return record.to_dict()
+		try:
+			return record.to_dict()
+		except Exception:
+			return str(record)
 	if is_dataclass(record) and not isinstance(record, type):
 		return asdict(record)
 	if isinstance(record, Path):
@@ -503,7 +509,7 @@ def _json_default(value: Any) -> Any:
 	normalized = normalize_record(value)
 	if normalized is not value:
 		return normalized
-	raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+	return str(value)  # last resort: never crash a write on an unknown object
 
 
 def _is_write_mode(mode: str) -> bool:
