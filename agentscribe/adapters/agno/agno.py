@@ -28,11 +28,12 @@ from __future__ import annotations
 
 import logging
 import time
+import uuid
 from collections.abc import Iterable, Mapping
 from typing import Any
 
 from agentscribe.adapters.base import BaseAdapter
-from agentscribe.core.canonical import CanonicalInteraction
+from agentscribe.core.canonical import CanonicalInteraction, CanonicalMessage
 from agentscribe.core.formatter import Formatter
 
 from ..utils import (
@@ -40,18 +41,79 @@ from ..utils import (
     append_unique_message,
     as_list,
     build_metadata,
+    coerce_text,
     compact_dict,
     get_value,
     interaction_from_messages,
     json_ready,
     message_to_canonical,
     object_to_dict,
+    parse_jsonish,
     resolve_identifier,
-    tool_call_message,
-    tool_response_message,
 )
 
 _logger = logging.getLogger("agentscribe.agno")
+
+
+# --- Canonical message builders compatible with core.formatter ----------------
+#
+# The formatter reads the STRUCTURED canonical fields (tool_name, tool_args,
+# tool_call_id, tool_result) and serializes tool_args verbatim into the emitted
+# function arguments. So these builders keep tool_args CLEAN (no aux keys) and
+# put the call id on the first-class ``tool_call_id`` field — never buried in
+# tool_args or a side metadata attribute.
+
+def _clean_args(tool_args: Any) -> dict[str, Any]:
+    """Return tool arguments as a clean, JSON-ready dict (no aux keys)."""
+
+    parsed = parse_jsonish(tool_args)
+    if isinstance(parsed, Mapping):
+        return {str(key): json_ready(value) for key, value in parsed.items()}
+    if parsed is None:
+        return {}
+    return {"value": json_ready(parsed)}
+
+
+def _tool_call_msg(
+    tool_name: Any,
+    arguments: Any,
+    call_id: Any,
+    *,
+    metadata: Mapping[str, Any] | None = None,
+) -> CanonicalMessage:
+    """Build a canonical ``tool_call`` message with a clean arg dict + id."""
+
+    message = CanonicalMessage(
+        role="tool_call",
+        content=coerce_text({"tool_name": tool_name, "tool_args": parse_jsonish(arguments)}),
+        tool_name=str(tool_name) if tool_name is not None else None,
+        tool_args=_clean_args(arguments),
+        tool_call_id=str(call_id) if call_id is not None else None,
+    )
+    if metadata:
+        setattr(message, "metadata", compact_dict(dict(metadata)))
+    return message
+
+
+def _tool_response_msg(
+    tool_name: Any,
+    result: Any,
+    call_id: Any,
+    *,
+    metadata: Mapping[str, Any] | None = None,
+) -> CanonicalMessage:
+    """Build a canonical ``tool_response`` message carrying the call id."""
+
+    message = CanonicalMessage(
+        role="tool_response",
+        content=coerce_text(result),
+        tool_name=str(tool_name) if tool_name is not None else None,
+        tool_result=coerce_text(result) if result is not None else None,
+        tool_call_id=str(call_id) if call_id is not None else None,
+    )
+    if metadata:
+        setattr(message, "metadata", compact_dict(dict(metadata)))
+    return message
 
 
 def _run_session_id(run_output: Any, *, fallback: Any = None) -> str | None:
@@ -97,23 +159,9 @@ def _tool_execution_messages(tool: Any) -> list[Any]:
 
     messages: list[Any] = []
     if tool_args is not None:
-        messages.append(
-            tool_call_message(
-                str(tool_name) if tool_name is not None else None,
-                tool_args,
-                tool_call_id=str(tool_call_id) if tool_call_id is not None else None,
-                metadata=metadata,
-            )
-        )
+        messages.append(_tool_call_msg(tool_name, tool_args, tool_call_id, metadata=metadata))
     if tool_result is not None:
-        messages.append(
-            tool_response_message(
-                str(tool_name) if tool_name is not None else None,
-                tool_result,
-                tool_call_id=str(tool_call_id) if tool_call_id is not None else None,
-                metadata=metadata,
-            )
-        )
+        messages.append(_tool_response_msg(tool_name, tool_result, tool_call_id, metadata=metadata))
     return messages
 
 
@@ -198,15 +246,15 @@ def from_run_output(run_output: Any, *, metadata: Mapping[str, Any] | None = Non
         interaction.messages.append(canonical)
         if canonical.role == "assistant":
             for name, arguments, call_id in _message_tool_calls(raw_message):
-                interaction.messages.append(tool_call_message(name, arguments, tool_call_id=call_id))
+                interaction.messages.append(_tool_call_msg(name, arguments, call_id))
                 saw_tool = True
         elif canonical.role == "tool_response":
             # Replace the plain conversion with one that carries the tool_call_id.
             tool_call_id = get_value(raw_message, "tool_call_id", "call_id", "id", default=None)
-            interaction.messages[-1] = tool_response_message(
+            interaction.messages[-1] = _tool_response_msg(
                 canonical.tool_name,
                 canonical.tool_result if canonical.tool_result is not None else canonical.content,
-                tool_call_id=str(tool_call_id) if tool_call_id is not None else None,
+                tool_call_id,
             )
             saw_tool = True
 
@@ -215,11 +263,19 @@ def from_run_output(run_output: Any, *, metadata: Mapping[str, Any] | None = Non
         interaction.messages.append(message_to_canonical({"role": "assistant", "content": content}))
 
     # Only fall back to the tools list when the transcript did not already carry
-    # the tool interactions, to avoid duplicating them.
+    # the tool interactions, to avoid duplicating them. Insert before a trailing
+    # assistant answer so call→result→answer order is preserved.
     if not saw_tool:
+        fallback: list[Any] = []
         for tool in _run_tools(run_output):
-            for message in _tool_execution_messages(tool):
-                append_unique_message(interaction, message)
+            fallback.extend(_tool_execution_messages(tool))
+        if fallback:
+            if interaction.messages and interaction.messages[-1].role == "assistant":
+                answer = interaction.messages.pop()
+                interaction.messages.extend(fallback)
+                interaction.messages.append(answer)
+            else:
+                interaction.messages.extend(fallback)
 
     model = _run_model(run_output)
     if model is not None:
@@ -416,20 +472,45 @@ class AgnoAdapter(BaseAdapter):
         """Agno post hook. Pass this to ``Agent(post_hooks=[...])``."""
 
         try:
+            # Build safe metadata without deep-converting the agent/session/run_context
+            safe_agent = getattr(agent, "name", None) or (str(agent) if agent is not None else None)
+            safe_session = str(session) if session is not None else None
+            safe_run_context = str(run_context) if run_context is not None else None
+
             metadata = compact_dict(
                 {
-                    "agent": object_to_dict(agent) or str(agent) if agent is not None else None,
-                    "session": object_to_dict(session) or str(session) if session is not None else None,
-                    "run_context": object_to_dict(run_context) or str(run_context) if run_context is not None else None,
+                    "agent": safe_agent,
+                    "session": safe_session,
+                    "run_context": safe_run_context,
                 }
             )
+
             interaction = from_run_output(run_output, metadata=metadata)
             if agent is not None and not interaction.metadata.get("agent_name"):
                 agent_name = get_value(agent, "name", default=None)
                 if agent_name is not None:
                     interaction.metadata["agent_name"] = str(agent_name)
-            for message in self._pending_tool_messages:
-                append_unique_message(interaction, message)
+
+            # from_run_output already extracts the run transcript's tools IN ORDER.
+            # The tool_hook also captures them; appending those copies at the end would
+            # duplicate the tools and drop a stray tool_response AFTER the final
+            # assistant answer -> an invalid trailing 'observation'/'tool' turn.
+            # So only fall back to the hook-captured messages when the transcript did
+            # NOT carry the tools, and splice them in before any trailing assistant
+            # answer so the conversation still ends on the model's turn.
+            already_has_tools = any(
+                m.role in ("tool_call", "tool_response") for m in interaction.messages
+            )
+            if not already_has_tools and self._pending_tool_messages:
+                trailing_answer = (
+                    interaction.messages.pop()
+                    if interaction.messages and interaction.messages[-1].role == "assistant"
+                    else None
+                )
+                for message in self._pending_tool_messages:
+                    append_unique_message(interaction, message)
+                if trailing_answer is not None:
+                    interaction.messages.append(trailing_answer)
             self._pending_tool_messages.clear()
             self._finalise_one(interaction)
         except Exception as exc:
@@ -443,18 +524,21 @@ class AgnoAdapter(BaseAdapter):
     ) -> Any:
         """Agno tool hook. Pass this to ``Agent(tool_hooks=[...])``."""
 
+        # A shared id links this call to its result for exact pairing downstream.
+        call_id = f"call_{uuid.uuid4().hex[:8]}"
         start_time = time.time()
         try:
             result = function_call(**arguments)
         except Exception as exc:
             duration_ms = int((time.time() - start_time) * 1000)
             self._pending_tool_messages.append(
-                tool_call_message(function_name, arguments)
+                _tool_call_msg(function_name, arguments, call_id)
             )
             self._pending_tool_messages.append(
-                tool_response_message(
+                _tool_response_msg(
                     function_name,
                     {"error": str(exc)},
+                    call_id,
                     metadata={"duration_ms": duration_ms, "error": exc.__class__.__name__},
                 )
             )
@@ -462,9 +546,9 @@ class AgnoAdapter(BaseAdapter):
             raise
 
         duration_ms = int((time.time() - start_time) * 1000)
-        self._pending_tool_messages.append(tool_call_message(function_name, arguments))
+        self._pending_tool_messages.append(_tool_call_msg(function_name, arguments, call_id))
         self._pending_tool_messages.append(
-            tool_response_message(function_name, result, metadata={"duration_ms": duration_ms})
+            _tool_response_msg(function_name, result, call_id, metadata={"duration_ms": duration_ms})
         )
         return result
 
