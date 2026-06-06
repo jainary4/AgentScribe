@@ -15,6 +15,7 @@ class CanonicalMessage:
     content: str
     tool_name: Optional[str] = None
     tool_args: Optional[dict[str, Any]] = None
+    tool_call_id: Optional[str] = None 
     tool_result: Optional[str] = None
 
     """msg = CanonicalMessage(
@@ -36,6 +37,8 @@ class CanonicalMessage:
             result["tool_name"] = self.tool_name
         if self.tool_args is not None:
             result["tool_args"] = self.tool_args
+        if self.tool_call_id is not None:        
+            result["tool_call_id"] = self.tool_call_id
         if self.tool_result is not None:
             result["tool_result"] = self.tool_result
         return result
@@ -56,6 +59,7 @@ class CanonicalMessage:
             content=data["content"],
             tool_name=data.get("tool_name"),
             tool_args=data.get("tool_args"),
+            tool_call_id=data.get("tool_call_id"),
             tool_result=data.get("tool_result"),
         )
     """Example:
