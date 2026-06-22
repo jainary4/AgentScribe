@@ -43,12 +43,28 @@ class InteractionCollector:
         formatter = Formatter(format_name or self.format_name)
         return [formatter.format_single(interaction) for interaction in self.interactions]
 
-    def flush(self, output_path: str | None = None, *, append: bool = False, format_name: str | None = None) -> int:
+    def flush(self, output_path: str | None = None, *, append: bool = True, format_name: str | None = None) -> int:
+        
         target = output_path or self.output_path
         if not target:
             raise AdapterError("flush requires an output_path")
-        records = self.format_records(format_name=format_name)
+        if not self.interactions:
+            return 0
+
+        # Snapshot what we're about to write so a concurrent record() (or a write
+        # failure) can't desync the drain below.
+        pending = self.interactions[:]
+        formatter = Formatter(format_name or self.format_name)
+        records = [formatter.format_single(interaction) for interaction in pending]
         result = write_jsonl(target, records, mode="a" if append else "w", format_name=format_name or self.format_name)
+
+        # Drain only on append. In append mode each flush must write *new* records,
+        # so we drop the ones we just persisted (this is what makes incremental
+        # flushing idempotent and stops re-flush from duplicating). In overwrite
+        # mode ("w") the file is the full snapshot every time, so we keep the
+        # interactions and never drain. We only drain after a successful write.
+        if append:
+            del self.interactions[:len(pending)]
         return result.records_written
 
 
