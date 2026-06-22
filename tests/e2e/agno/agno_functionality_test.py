@@ -20,6 +20,7 @@ from agno.agent import Agent
 from agno.models.openrouter import OpenRouter
 from agno.tools.duckduckgo import DuckDuckGoTools
 from agno.db.sqlite import SqliteDb
+from agno.tools.yfinance import YFinanceTools
 
 from agentscribe.core.formatter import Formatter
 from agentscribe.storage import write_jsonl
@@ -30,16 +31,16 @@ from agentscribe.adapters.agno import (
 
 OUT = Path("./out"); OUT.mkdir(exist_ok=True)
 MODEL = "google/gemini-3.1-flash-lite"
-FORMAT = "alpaca"
+FORMAT = "openai_chat"
 ALPACA_SYSTEM_AS_INSTRUCTION = False  # True -> classic instruction/input mapping
 
 # System prompts for the INSTRUCTED agents:
-EXTRACT_LANGS = "Extract all programming languages mentioned in the text and return them as a comma-separated list."
-CONCISE       = "You are a concise assistant. Answer in one short sentence."
+EXTRACT_LANGS = "Use both DuckDuckGo and YFinanceTools to give me a summary on the topic the user asks"
+CONCISE       = "You are a research agent. Always give 2 paragraph summaries of the research topic "
 
 def make_agent(tools=False, instructions=None):
     return Agent(model=OpenRouter(id=MODEL),
-                 tools=[DuckDuckGoTools()] if tools else None,
+                 tools=[DuckDuckGoTools(),YFinanceTools()] if tools else None,
                  instructions=instructions)
 
 def fmt():
@@ -49,7 +50,7 @@ def fmt():
 # 1. from_run_output  — INSTRUCTED agent (task in system prompt, data in user msg)
 def method_1_run_output():
     agent = make_agent(instructions=EXTRACT_LANGS)
-    run = agent.run("We built pipelines in Python, some services in Rust, kept legacy parts in C++.")
+    run = agent.run("Give me anlysis on the nvidia stock and how its performance correlates to the performance of AMD stock ")
     write_jsonl(OUT / "m1_run_output.jsonl", [fmt().format_single(from_run_output(run))], mode="a")
 
 
@@ -98,8 +99,9 @@ def method_5_live_hooks():
         agent = Agent(model=OpenRouter(id=MODEL), tools=[DuckDuckGoTools()],
                       instructions=CONCISE,
                       post_hooks=[capture.post_hook], tool_hooks=[capture.tool_hook])
-        agent.run("What is the current weather in Toronto?")
-        agent.run("Tell me a joke about Python.")
+        for i in range(10):
+            agent.run("What is the current weather in Toronto?")
+            agent.run("Tell me a joke about Python.")
 
 
 # 6. AgnoTraceCollector — MIX: one instructed run, one plain run, one trace
