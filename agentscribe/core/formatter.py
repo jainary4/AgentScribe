@@ -144,7 +144,7 @@ class Formatter:
                     # Merge assistant text + its tool calls into one message.
                     formatted.append({
                         "role": "assistant",
-                        "content": text if text.strip() else None,
+                        "content": text if text.strip() else  "",
                         "tool_calls": calls,
                     })
                     i = j
@@ -155,7 +155,7 @@ class Formatter:
 
             elif role == "tool_call":
                 calls, j = collect_tool_calls(i)
-                formatted.append({"role": "assistant", "content": None, "tool_calls": calls})
+                formatted.append({"role": "assistant", "content": "", "tool_calls": calls})
                 i = j
 
             elif role == "tool_response":
