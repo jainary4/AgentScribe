@@ -73,6 +73,45 @@ def test_from_chat_history_accepts_list_and_preserves_raw() -> None:
     assert interaction.extra["raw_chat_history"]["chat_history"][0]["content"] == "hello"
 
 
+def test_from_chat_history_corrects_ag2_inverted_roles() -> None:
+    # AG2 stores chat_history from the initiator's perspective: the human's turn
+    # is recorded role="assistant" and the agent's reply role="user". The adapter
+    # must resolve user/assistant by `name`, not the inverted `role`. (Format
+    # validation can't catch this — an inverted transcript is still valid-shaped.)
+    history = [
+        {"role": "system", "content": "You are helpful."},
+        {"content": "Translate 'hi'.", "role": "assistant", "name": "user"},   # actually the human
+        {"content": "Bonjour", "role": "user", "name": "plain"},               # actually the agent
+    ]
+    interaction = from_chat_history(history)
+
+    assert [m.role for m in interaction.messages] == ["system", "user", "assistant"]
+    assert interaction.messages[1].content == "Translate 'hi'."
+    assert interaction.messages[2].content == "Bonjour"
+
+
+def test_from_chat_history_parses_nested_tool_calls_with_clean_args() -> None:
+    # Real AG2 tool shape: name/arguments are nested under `function`, the tool
+    # call carries a real id, and there is no internal bookkeeping in the args.
+    history = [
+        {"role": "system", "content": "Use multiply."},
+        {"content": "6 times 7.", "role": "assistant", "name": "user"},
+        {"tool_calls": [{"id": "call_x", "type": "function",
+                         "function": {"name": "multiply", "arguments": '{"a": 6, "b": 7}'}}],
+         "content": None, "role": "assistant"},
+        {"content": "42", "tool_responses": [{"tool_call_id": "call_x", "role": "tool", "content": "42"}],
+         "role": "tool", "name": "user"},
+    ]
+    interaction = from_chat_history(history)
+
+    assert [m.role for m in interaction.messages] == ["system", "user", "tool_call", "tool_response"]
+    call = next(m for m in interaction.messages if m.role == "tool_call")
+    response = next(m for m in interaction.messages if m.role == "tool_response")
+    assert call.tool_name == "multiply" and call.tool_call_id == "call_x"
+    assert call.tool_args == {"a": 6, "b": 7}          # no internal _agentscribe leak
+    assert response.tool_call_id == "call_x"           # response links back to the call
+
+
 def test_from_stream_events_records_spans_and_final_result_messages() -> None:
     events = [
         {"type": "StreamingChunk", "content": "partial"},

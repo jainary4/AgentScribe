@@ -47,6 +47,11 @@ temp/
 # Generated training data from e2e/demo runs (regenerated, never committed)
 agno_training.jsonl
 *_training.jsonl
+agentscribe_data.jsonl
+
+# e2e functionality-script outputs (inspect locally; regenerated, never committed)
+tests/e2e/**/out/
+tests/e2e/**/out_*/
 
 # Notebook and REPL checkpoints
 .ipynb_checkpoints/
